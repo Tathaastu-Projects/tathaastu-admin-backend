@@ -82,6 +82,22 @@ const productSchema = new mongoose.Schema(
       color: { type: String, default: "" },
       occasion: { type: String, default: "" },
       zodiac: { type: String, default: "" },
+      material: { type: String, default: "" },
+      mukhi: { type: String, default: "" },
+      jewelryType: { type: String, default: "" },
+      planet: { type: String, default: "" },
+      origin: { type: String, default: "" },
+    },
+    // Numeric filters (gemstones)
+    weightCarat: { type: Number, default: null, index: true },
+    weightRatti: { type: Number, default: null, index: true },
+    tags: { type: [String], default: [], index: true },
+    ratingAvg: { type: Number, default: 0 },
+    ratingCount: { type: Number, default: 0 },
+    source: {
+      provider: { type: String, default: "" },
+      externalId: { type: String, default: "" },
+      externalHandle: { type: String, default: "" },
     },
     seo: {
       metaTitle: { type: String, default: "" },

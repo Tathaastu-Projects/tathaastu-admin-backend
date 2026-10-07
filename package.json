@@ -9,6 +9,9 @@
     "seed": "node scripts/seed.js",
     "seed:remedies": "node scripts/seedRemedies.js",
     "seed:products": "node scripts/seedProducts.js",
+    "import:gemsmantra": "node scripts/importGemsmantraProducts.js",
+    "import:gemsmantra:collections": "node scripts/importGemsmantraCollections.js",
+    "enrich:figma": "node scripts/enrichCatalogForFigma.js",
     "extract:pdfs": "node scripts/extractPdfs.js"
   },
   "dependencies": {

@@ -3,6 +3,7 @@ const Product = require("../models/Product");
 const ProductAudit = require("../models/ProductAudit");
 const Remedy = require("../models/Remedy");
 const { uploadProductImages } = require("../middleware/upload");
+const { queryCatalog, queryFacets } = require("../lib/storeCatalog");
 
 const router = express.Router();
 
@@ -112,7 +113,20 @@ function normalizeProductPayload(body = {}) {
       color: String(body.attributes?.color || "").trim(),
       occasion: String(body.attributes?.occasion || "").trim(),
       zodiac: String(body.attributes?.zodiac || "").trim(),
+      material: String(body.attributes?.material || "").trim(),
+      mukhi: String(body.attributes?.mukhi || "").trim(),
+      jewelryType: String(body.attributes?.jewelryType || "").trim(),
+      planet: String(body.attributes?.planet || "").trim(),
+      origin: String(body.attributes?.origin || "").trim(),
     },
+    tags: Array.isArray(body.tags)
+      ? body.tags.map((t) => String(t).trim().toLowerCase()).filter(Boolean)
+      : String(body.tags || "")
+          .split(",")
+          .map((t) => t.trim().toLowerCase())
+          .filter(Boolean),
+    weightCarat: body.weightCarat === "" || body.weightCarat == null ? null : Number(body.weightCarat),
+    weightRatti: body.weightRatti === "" || body.weightRatti == null ? null : Number(body.weightRatti),
     seo: {
       metaTitle: String(body.seo?.metaTitle || body.title || "").trim(),
       metaDescription: String(body.seo?.metaDescription || body.shortDescription || "").trim(),
@@ -157,14 +171,30 @@ router.get("/meta", async (_req, res) => {
 
 router.get("/stats", async (_req, res) => {
   try {
-    const [total, listed, draft, unlisted, lowStock] = await Promise.all([
+    const [total, listed, draft, unlisted, byCategory, lowStockAgg] = await Promise.all([
       Product.countDocuments(),
       Product.countDocuments({ status: "listed" }),
       Product.countDocuments({ status: "draft" }),
       Product.countDocuments({ status: "unlisted" }),
-      Product.find({}).then((items) => items.filter((item) => item.isLowStock).length),
+      Product.aggregate([{ $group: { _id: "$category", count: { $sum: 1 } } }]),
+      Product.aggregate([
+        {
+          $addFields: {
+            stockTotal: {
+              $cond: [
+                { $gt: [{ $size: { $ifNull: ["$variants", []] } }, 0] },
+                { $sum: "$variants.quantity" },
+                { $ifNull: ["$quantity", 0] },
+              ],
+            },
+            threshold: { $ifNull: ["$lowStockThreshold", 5] },
+          },
+        },
+        { $match: { $expr: { $lte: ["$stockTotal", "$threshold"] } } },
+        { $count: "count" },
+      ]),
     ]);
-    const byCategory = await Product.aggregate([{ $group: { _id: "$category", count: { $sum: 1 } } }]);
+
     res.json({
       success: true,
       data: {
@@ -172,7 +202,7 @@ router.get("/stats", async (_req, res) => {
         listed,
         draft,
         unlisted,
-        lowStock,
+        lowStock: lowStockAgg[0]?.count || 0,
         byCategory: byCategory.reduce((acc, row) => {
           acc[row._id] = row.count;
           return acc;
@@ -180,6 +210,7 @@ router.get("/stats", async (_req, res) => {
       },
     });
   } catch (error) {
+    console.error("Product stats error:", error);
     res.status(500).json({ success: false, message: "Failed to load product stats" });
   }
 });
@@ -199,47 +230,22 @@ router.get("/audits", async (req, res) => {
 // Public catalog for website
 router.get("/public", async (req, res) => {
   try {
-    const {
-      category,
-      intention,
-      featured,
-      bestSeller,
-      isNew,
-      isNewArrival,
-      q,
-      zodiac,
-      limit = 40,
-      page = 1,
-    } = req.query;
-
-    const filter = { status: "listed" };
-    if (category) filter.category = category;
-    if (intention) filter.intentions = intention;
-    if (featured === "true") filter.isFeatured = true;
-    if (bestSeller === "true") filter.isBestSeller = true;
-    if (isNewArrival === "true" || isNew === "true") filter.isNewArrival = true;
-    if (zodiac) filter["attributes.zodiac"] = new RegExp(String(zodiac), "i");
-    if (q) filter.$text = { $search: String(q) };
-
-    const skip = (Math.max(Number(page) || 1, 1) - 1) * (Number(limit) || 40);
-    const [items, total] = await Promise.all([
-      Product.find(filter)
-        .sort({ isFeatured: -1, isBestSeller: -1, createdAt: -1 })
-        .skip(skip)
-        .limit(Number(limit) || 40),
-      Product.countDocuments(filter),
-    ]);
-
-    res.json({
+    const result = await queryCatalog(req.query);
+    const payload = {
       success: true,
-      data: items,
-      pagination: {
-        total,
-        page: Number(page) || 1,
-        limit: Number(limit) || 40,
-        pages: Math.ceil(total / (Number(limit) || 40)),
-      },
-    });
+      data: result.items,
+      pagination: result.pagination,
+      priceStats: result.priceStats,
+      appliedFilters: result.params,
+    };
+
+    if (result.params.includeFacets) {
+      const facets = await queryFacets(req.query);
+      payload.facets = facets.facets;
+      payload.sortOptions = facets.sortOptions;
+    }
+
+    res.json(payload);
   } catch (error) {
     console.error("Public products error:", error);
     res.status(500).json({ success: false, message: "Failed to load public products" });
@@ -260,24 +266,80 @@ router.get("/public/:slug", async (req, res) => {
 
 router.get("/", async (req, res) => {
   try {
-    const { status, category, intention, q, lowStock, limit = 100 } = req.query;
+    const { status, category, intention, q, lowStock, page = 1, limit = 50 } = req.query;
     const filter = {};
     if (status) filter.status = status;
     if (category) filter.category = category;
     if (intention) filter.intentions = intention;
     if (q) {
       filter.$or = [
-        { title: new RegExp(q, "i") },
-        { sku: new RegExp(q, "i") },
-        { description: new RegExp(q, "i") },
+        { title: new RegExp(String(q), "i") },
+        { sku: new RegExp(String(q), "i") },
+        { description: new RegExp(String(q), "i") },
+        { shortDescription: new RegExp(String(q), "i") },
+        { slug: new RegExp(String(q), "i") },
       ];
     }
 
-    let items = await Product.find(filter).sort({ updatedAt: -1 }).limit(Number(limit) || 100);
+    const pageNum = Math.max(Number(page) || 1, 1);
+    const limitNum = Math.min(Math.max(Number(limit) || 50, 1), 200);
+
+    // Low-stock filter needs computed stock — use aggregation path
     if (lowStock === "true") {
-      items = items.filter((item) => item.isLowStock);
+      const pipeline = [
+        { $match: filter },
+        {
+          $addFields: {
+            stockTotal: {
+              $cond: [
+                { $gt: [{ $size: { $ifNull: ["$variants", []] } }, 0] },
+                { $sum: "$variants.quantity" },
+                { $ifNull: ["$quantity", 0] },
+              ],
+            },
+            threshold: { $ifNull: ["$lowStockThreshold", 5] },
+          },
+        },
+        { $match: { $expr: { $lte: ["$stockTotal", "$threshold"] } } },
+        { $sort: { updatedAt: -1 } },
+        {
+          $facet: {
+            items: [{ $skip: (pageNum - 1) * limitNum }, { $limit: limitNum }],
+            totalCount: [{ $count: "count" }],
+          },
+        },
+      ];
+      const [result] = await Product.aggregate(pipeline);
+      const items = result?.items || [];
+      const total = result?.totalCount?.[0]?.count || 0;
+      return res.json({
+        success: true,
+        data: items,
+        pagination: {
+          total,
+          page: pageNum,
+          limit: limitNum,
+          pages: Math.ceil(total / limitNum) || 1,
+        },
+      });
     }
-    res.json({ success: true, data: items });
+
+    const skip = (pageNum - 1) * limitNum;
+    const [items, total] = await Promise.all([
+      Product.find(filter).sort({ updatedAt: -1 }).skip(skip).limit(limitNum),
+      Product.countDocuments(filter),
+    ]);
+
+    res.json({
+      success: true,
+      data: items,
+      pagination: {
+        total,
+        page: pageNum,
+        limit: limitNum,
+        pages: Math.ceil(total / limitNum) || 1,
+      },
+    });
   } catch (error) {
     console.error("List products error:", error);
     res.status(500).json({ success: false, message: "Failed to load products" });

@@ -10,6 +10,7 @@ const Product = require("../models/Product");
 const { StoreBanner, StoreBlogPost, StorePage } = require("../models/StoreCms");
 const { findValidCoupon, computeCouponDiscount } = require("../lib/storeCoupons");
 const { signCustomerToken, optionalStoreAuth, requireStoreAuth } = require("../middleware/storeAuth");
+const { restoreStock } = require("../lib/storeStock");
 
 const router = express.Router();
 
@@ -501,6 +502,72 @@ router.post("/payments/razorpay/verify", async (req, res) => {
   }
 });
 
+/**
+ * Cancel an unpaid online order (e.g. Razorpay modal dismissed) and restore stock.
+ * POST /api/store/payments/cancel-unpaid
+ */
+router.post("/payments/cancel-unpaid", async (req, res) => {
+  try {
+    const storeOrderId = req.body?.storeOrderId;
+    let order = null;
+
+    if (storeOrderId && mongoose.Types.ObjectId.isValid(storeOrderId)) {
+      order = await StoreOrder.findById(storeOrderId);
+    }
+
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    if (order.paymentMethod !== "online") {
+      return res.status(400).json({
+        success: false,
+        message: "Only online payment orders can be cancelled this way",
+      });
+    }
+
+    if (order.paymentStatus === "paid") {
+      return res.status(400).json({ success: false, message: "Order already paid" });
+    }
+
+    if (order.status === "cancelled") {
+      return res.json({
+        success: true,
+        message: "Order already cancelled",
+        data: { orderNumber: order.orderNumber, status: order.status },
+      });
+    }
+
+    if (order.paymentStatus !== "pending" || !["placed", "confirmed"].includes(order.status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Order cannot be cancelled in its current state",
+      });
+    }
+
+    if (order.stockDecremented) {
+      for (const item of order.items) {
+        // eslint-disable-next-line no-await-in-loop
+        await restoreStock(item.productId, item.variantId, item.quantity);
+      }
+      order.stockDecremented = false;
+    }
+
+    order.status = "cancelled";
+    order.paymentStatus = "failed";
+    await order.save();
+
+    res.json({
+      success: true,
+      message: "Unpaid order cancelled and stock restored",
+      data: { orderNumber: order.orderNumber, status: order.status },
+    });
+  } catch (error) {
+    console.error("Cancel unpaid order error:", error);
+    res.status(500).json({ success: false, message: "Failed to cancel unpaid order" });
+  }
+});
+
 /* ------------------------ CMS: banners / blogs / pages ------------------------ */
 
 router.get("/content/home", async (_req, res) => {
@@ -611,7 +678,7 @@ router.get("/content/home", async (_req, res) => {
           title: "Not sure what to buy? Talk to our experts",
           subtitle: "Get a free recommendation aligned to your intention.",
           ctaLabel: "Consult Now",
-          ctaHref: "/consultation",
+          ctaHref: "/contact",
         },
         stats: {
           listedProducts: listedTotal,

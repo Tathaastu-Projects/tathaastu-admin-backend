@@ -15,4 +15,10 @@ npm run dev
 
 - `npm start` — run the server
 - `npm run dev` — run with nodemon
-- `npm run seed` — seed data (if `scripts/seed.js` is present)
+- `npm run seed` — remedies + sample products + store collections/CMS/coupons
+- `npm run seed:remedies` / `npm run seed:products` — individual seeds
+- `npm run import:gemsmantra` — full product import (optional)
+
+Pair with storefront: sibling folder `abhimantrit` (`NEXT_PUBLIC_API_URL` → this server).
+
+See `brain/overview.md`.

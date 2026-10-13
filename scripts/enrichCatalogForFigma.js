@@ -133,7 +133,7 @@ async function seedHomeContent() {
       subtitle: "Get a free recommendation aligned to your intention or birth chart.",
       imageUrl: "",
       ctaLabel: "Consult Now",
-      ctaHref: "/consultation",
+      ctaHref: "/contact",
       sortOrder: 10,
       isActive: true,
     },

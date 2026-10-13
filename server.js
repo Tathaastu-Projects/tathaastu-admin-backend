@@ -1,4 +1,5 @@
 const path = require("path");
+const dns = require("dns");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 const express = require("express");
 const mongoose = require("mongoose");
@@ -13,6 +14,10 @@ app.use(express.urlencoded({ extended: true }));
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 // MongoDB Connection
+// mongodb+srv:// needs DNS SRV lookups. Some ISP resolvers return ESERVFAIL /
+// ECONNREFUSED for Atlas — prefer public DNS so Node can resolve the cluster.
+dns.setServers(["8.8.8.8", "1.1.1.1", ...dns.getServers()]);
+
 const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/tathasstu-admin";
 
 mongoose

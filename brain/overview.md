@@ -17,6 +17,7 @@ Single Express + MongoDB API for **admin portal** and **storefront**.
 | `/api/products` | Admin CRUD (+ `/public` for store fallback) |
 | `/api/queries`, `/api/remedies`, `/api/users`, `/api/courses`, `/api/orders`, `/api/events`, `/api/notifications`, `/api/analytics` | Admin |
 | `/api/store` | Store public + nested `/admin/*` (orders, CMS, coupons…) |
+| `/api/store/admin/home-banners` | Homepage slider: list, upload, edit text and button category, delete |
 | `/api/health` | Health |
 | `/uploads` | Static uploads |
 

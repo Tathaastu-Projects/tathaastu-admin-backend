@@ -4,6 +4,7 @@ const Product = require("../models/Product");
 const StoreOrder = require("../models/StoreOrder");
 const StoreLead = require("../models/StoreLead");
 const StoreCollection = require("../models/StoreCollection");
+const { StorePage } = require("../models/StoreCms");
 const { storeCollectionsSeed } = require("../data/storeCollectionsSeed");
 const {
   CATEGORIES,
@@ -89,10 +90,18 @@ function resolveLinePricing(product, variant) {
  * GET /api/store/meta
  * Nav + filter constants for the storefront.
  */
-router.get("/meta", (_req, res) => {
+router.get("/meta", async (_req, res) => {
+  let logoUrl = "/tathaastu_logo.png";
+  try {
+    const logo = await StorePage.findOne({ slug: "site-logo" }).select("content").lean();
+    if (logo?.content) logoUrl = String(logo.content);
+  } catch (_error) {
+    logoUrl = "/tathaastu_logo.png";
+  }
   res.json({
     success: true,
     data: {
+      logoUrl,
       categories: CATEGORIES,
       intentions: INTENTIONS,
       zodiacSigns: ZODIAC_SIGNS,

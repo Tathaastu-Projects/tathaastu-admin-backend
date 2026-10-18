@@ -92,6 +92,14 @@ const productSchema = new mongoose.Schema(
     weightCarat: { type: Number, default: null, index: true },
     weightRatti: { type: Number, default: null, index: true },
     tags: { type: [String], default: [], index: true },
+    hoverDetails: {
+      type: [
+        {
+          label: { type: String, trim: true, default: "" },
+        },
+      ],
+      default: [],
+    },
     ratingAvg: { type: Number, default: 0 },
     ratingCount: { type: Number, default: 0 },
     source: {

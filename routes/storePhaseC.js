@@ -1,5 +1,7 @@
 const express = require("express");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 const mongoose = require("mongoose");
 const StoreCustomer = require("../models/StoreCustomer");
 const StoreReview = require("../models/StoreReview");
@@ -11,6 +13,18 @@ const { StoreBanner, StoreBlogPost, StorePage } = require("../models/StoreCms");
 const { findValidCoupon, computeCouponDiscount } = require("../lib/storeCoupons");
 const { signCustomerToken, optionalStoreAuth, requireStoreAuth } = require("../middleware/storeAuth");
 const { restoreStock } = require("../lib/storeStock");
+const { uploadBannerImage, uploadFeaturedMedia } = require("../middleware/upload");
+const { HERO_CATEGORIES, HOME_SLIDER_KEY, categoryById } = require("../lib/heroCategories");
+const { CATEGORY_TILES, TILE_SLUG, tileById } = require("../lib/categoryTiles");
+const {
+  ABOUT_IMAGE,
+  ABOUT_WIDTH,
+  ABOUT_HEIGHT,
+  ABOUT_INTRO,
+  ABOUT_FEATURES,
+  ABOUT_SLUG,
+  aboutFeatureById,
+} = require("../lib/aboutSection");
 
 const router = express.Router();
 
@@ -580,10 +594,9 @@ router.get("/content/home", async (_req, res) => {
       queryCatalog,
     } = require("../lib/storeCatalog");
 
-    const [banners, posts, faqsPage, categoryCounts] = await Promise.all([
+    const [banners, posts, categoryCounts] = await Promise.all([
       StoreBanner.find({ isActive: true }).sort({ sortOrder: 1, createdAt: -1 }),
       StoreBlogPost.find({ status: "published" }).sort({ publishedAt: -1 }).limit(6),
-      StorePage.findOne({ slug: "home-faq", isActive: true }),
       Product.aggregate([
         { $match: { status: "listed" } },
         { $group: { _id: "$category", count: { $sum: 1 } } },
@@ -611,15 +624,7 @@ router.get("/content/home", async (_req, res) => {
       });
     }
 
-    let faqs = [];
-    if (faqsPage?.content) {
-      try {
-        const parsed = JSON.parse(faqsPage.content);
-        if (Array.isArray(parsed)) faqs = parsed;
-      } catch (_e) {
-        faqs = [{ question: "FAQ", answer: String(faqsPage.content) }];
-      }
-    }
+    const faqs = await readHomeFaqs();
 
     const intentionMeta = {
       Peace: { color: "#7BA3A8", icon: "peace" },
@@ -647,6 +652,10 @@ router.get("/content/home", async (_req, res) => {
           tagline: "Authentic Rudraksha & Gemstones",
         },
         banners,
+        homeSliderManaged: true,
+        categoryTiles: await readCategoryTiles(),
+        aboutSection: await readAboutSection(),
+        featuredFinds: await readFeaturedFinds(),
         trustBadges: [
           { id: "authentic", label: "Authentic & Certified", description: "Curated listed products" },
           { id: "ship", label: "Free Shipping", description: "On eligible orders" },
@@ -673,7 +682,6 @@ router.get("/content/home", async (_req, res) => {
         },
         latestBlogs: posts,
         faqs,
-        faqPage: faqsPage,
         consultCta: {
           title: "Not sure what to buy? Talk to our experts",
           subtitle: "Get a free recommendation aligned to your intention.",
@@ -762,6 +770,593 @@ router.put("/admin/banners/:id", async (req, res) => {
     res.json({ success: true, data: banner });
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to update banner" });
+  }
+});
+
+function removeBannerFile(imageUrl) {
+  if (!imageUrl || !String(imageUrl).startsWith("/uploads/banners/")) return;
+  const file = path.join(__dirname, "..", String(imageUrl).replace(/^\/+/, ""));
+  fs.unlink(file, () => {});
+}
+
+function readBannerFields(body, file) {
+  const title = String(body?.title || "").trim();
+  const titleLine2 = String(body?.titleLine2 || "").trim();
+  const subtitle = String(body?.subtitle || "").trim();
+  const category = String(body?.category || "").trim();
+  const cat = categoryById(category);
+  const ctaLabel = String(body?.ctaLabel || "").trim() || (cat ? `Explore ${cat.label}` : "Explore");
+  const sortOrder = Number(body?.sortOrder);
+  const isActive = body?.isActive === undefined || body?.isActive === ""
+    ? true
+    : body.isActive === true || body.isActive === "true";
+  const payload = {
+    key: HOME_SLIDER_KEY,
+    title,
+    titleLine2,
+    subtitle,
+    category: cat ? cat.id : "",
+    ctaLabel,
+    ctaHref: cat ? cat.href : "/shop",
+    sortOrder: Number.isFinite(sortOrder) ? sortOrder : 0,
+    isActive,
+  };
+  if (file) payload.imageUrl = `/uploads/banners/${file.filename}`;
+  return payload;
+}
+
+async function readSiteLogo() {
+  const page = await StorePage.findOne({ slug: "site-logo" }).select("content").lean();
+  return page?.content ? String(page.content) : "/tathaastu_logo.png";
+}
+
+router.get("/admin/home-banners", async (_req, res) => {
+  try {
+    const [data, logoUrl] = await Promise.all([
+      StoreBanner.find({ key: HOME_SLIDER_KEY }).sort({ sortOrder: 1, createdAt: 1 }),
+      readSiteLogo(),
+    ]);
+    res.json({ success: true, data, categories: HERO_CATEGORIES, logoUrl });
+  } catch (error) {
+    console.error("List home banners error:", error);
+    res.status(500).json({ success: false, message: "Failed to load banners" });
+  }
+});
+
+router.put("/admin/logo", (req, res) => {
+  uploadBannerImage.single("image")(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      if (!req.file) {
+        return res.status(400).json({ success: false, message: "Logo image is required" });
+      }
+      const imageUrl = `/uploads/banners/${req.file.filename}`;
+      const existing = await StorePage.findOne({ slug: "site-logo" }).select("content").lean();
+      if (existing?.content && existing.content !== imageUrl) removeBannerFile(existing.content);
+      await StorePage.findOneAndUpdate(
+        { slug: "site-logo" },
+        {
+          $set: { title: "Site logo", content: imageUrl, isActive: true },
+          $setOnInsert: { slug: "site-logo" },
+        },
+        { upsert: true, new: true }
+      );
+      res.json({ success: true, data: { imageUrl } });
+    } catch (error) {
+      console.error("Update logo error:", error);
+      res.status(500).json({ success: false, message: "Failed to update logo" });
+    }
+  });
+});
+
+async function readCategoryTiles() {
+  const page = await StorePage.findOne({ slug: TILE_SLUG }).select("content").lean();
+  let saved = [];
+  if (page?.content) {
+    try {
+      const parsed = JSON.parse(page.content);
+      if (Array.isArray(parsed)) saved = parsed;
+    } catch (_error) {
+      saved = [];
+    }
+  }
+  const byId = Object.fromEntries(saved.map((item) => [item.id, item]));
+  return CATEGORY_TILES.map((tile) => {
+    const custom = byId[tile.id] || {};
+    return {
+      ...tile,
+      label: String(custom.label || tile.label),
+      image: String(custom.image || tile.image),
+    };
+  });
+}
+
+async function writeCategoryTiles(tiles) {
+  const content = JSON.stringify(
+    tiles.map((tile) => ({ id: tile.id, label: tile.label, image: tile.image }))
+  );
+  await StorePage.findOneAndUpdate(
+    { slug: TILE_SLUG },
+    {
+      $set: { title: "Shop by Category", content, isActive: true },
+      $setOnInsert: { slug: TILE_SLUG },
+    },
+    { upsert: true }
+  );
+}
+
+router.get("/admin/category-tiles", async (_req, res) => {
+  try {
+    const data = await readCategoryTiles();
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error("List category tiles error:", error);
+    res.status(500).json({ success: false, message: "Failed to load categories" });
+  }
+});
+
+router.put("/admin/category-tiles/:id", (req, res) => {
+  uploadBannerImage.single("image")(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      const base = tileById(req.params.id);
+      if (!base) {
+        if (req.file) removeBannerFile(`/uploads/banners/${req.file.filename}`);
+        return res.status(404).json({ success: false, message: "Category frame not found" });
+      }
+      const label = String(req.body?.label || "").trim();
+      if (!label) {
+        if (req.file) removeBannerFile(`/uploads/banners/${req.file.filename}`);
+        return res.status(400).json({ success: false, message: "Name is required" });
+      }
+      const tiles = await readCategoryTiles();
+      const current = tiles.find((tile) => tile.id === base.id);
+      let image = current?.image || base.image;
+      if (req.file) {
+        const nextImage = `/uploads/banners/${req.file.filename}`;
+        if (image !== nextImage) removeBannerFile(image);
+        image = nextImage;
+      }
+      const next = tiles.map((tile) => (tile.id === base.id ? { ...tile, label, image } : tile));
+      await writeCategoryTiles(next);
+      res.json({ success: true, data: next.find((tile) => tile.id === base.id) });
+    } catch (error) {
+      console.error("Update category tile error:", error);
+      res.status(500).json({ success: false, message: "Failed to update category" });
+    }
+  });
+});
+
+async function readAboutSection() {
+  const page = await StorePage.findOne({ slug: ABOUT_SLUG }).select("content").lean();
+  let saved = {};
+  if (page?.content) {
+    try {
+      saved = JSON.parse(page.content) || {};
+    } catch (_error) {
+      saved = {};
+    }
+  }
+  const savedFeatures = Array.isArray(saved.features) ? saved.features : [];
+  const byId = Object.fromEntries(savedFeatures.map((item) => [item.id, item]));
+  return {
+    image: String(saved.image || ABOUT_IMAGE),
+    intro: String(saved.intro || ABOUT_INTRO),
+    width: ABOUT_WIDTH,
+    height: ABOUT_HEIGHT,
+    features: ABOUT_FEATURES.map((item) => {
+      const custom = byId[item.id] || {};
+      return {
+        ...item,
+        title: String(custom.title || item.title),
+        description: String(custom.description || item.description),
+        image: String(custom.image || item.image || ""),
+      };
+    }),
+  };
+}
+
+async function writeAboutSection(section) {
+  await StorePage.findOneAndUpdate(
+    { slug: ABOUT_SLUG },
+    {
+      $set: {
+        title: "About Abhimantrit",
+        content: JSON.stringify({
+          image: section.image,
+          intro: section.intro,
+          features: section.features.map((item) => ({
+            id: item.id,
+            title: item.title,
+            description: item.description,
+            image: item.image || "",
+          })),
+        }),
+        isActive: true,
+      },
+      $setOnInsert: { slug: ABOUT_SLUG },
+    },
+    { upsert: true }
+  );
+}
+
+router.get("/admin/about", async (_req, res) => {
+  try {
+    const data = await readAboutSection();
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error("Load about section error:", error);
+    res.status(500).json({ success: false, message: "Failed to load about section" });
+  }
+});
+
+router.put("/admin/about", (req, res) => {
+  uploadBannerImage.single("image")(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      const intro = String(req.body?.intro || "").trim();
+      if (!intro) {
+        if (req.file) removeBannerFile(`/uploads/banners/${req.file.filename}`);
+        return res.status(400).json({ success: false, message: "Intro text is required" });
+      }
+      const section = await readAboutSection();
+      if (req.file) {
+        const nextImage = `/uploads/banners/${req.file.filename}`;
+        if (section.image !== nextImage) removeBannerFile(section.image);
+        section.image = nextImage;
+      }
+      section.intro = intro;
+      await writeAboutSection(section);
+      res.json({ success: true, data: section });
+    } catch (error) {
+      console.error("Update about section error:", error);
+      res.status(500).json({ success: false, message: "Failed to update about section" });
+    }
+  });
+});
+
+const HOME_FAQ_SLUG = "home-faq";
+
+const DEFAULT_HOME_FAQS = [
+  {
+    question: "How do I know which gemstone is right for me?",
+    answer:
+      "Choosing a gemstone can be personal. In Vedic astrology, suitability may depend on factors in an individual's birth chart rather than only their zodiac sign. If you are unsure, you can seek personalised guidance before making your choice.",
+  },
+  {
+    question: "Are Abhimantrit gemstones authentic?",
+    answer:
+      "At Abhimantrit, we bring together natural and authentic gemstones, carefully selected for their quality and traditional significance. Where applicable, certification details are provided to help you understand and choose your gemstone with confidence.",
+  },
+  {
+    question: "What does a gemstone certificate tell me?",
+    answer:
+      "A gemstone certificate provides important details about the stone and its characteristics, as assessed by a recognised certifying laboratory. The information may vary depending on the gemstone and certification authority. You can review the certificate provided with your gemstone for a clearer understanding of your purchase.",
+  },
+  {
+    question: "Are Abhimantrit Rudraksha original?",
+    answer:
+      "Yes. Abhimantrit offers original Rudraksha, carefully selected for authenticity and quality. Where applicable, product-specific certification and authenticity details are provided, along with information about the Rudraksha’s Mukhi and traditional associations.",
+  },
+  {
+    question: "What is gemstone energisation?",
+    answer:
+      "Gemstone energisation is a traditional practice rooted in Vedic traditions. At Abhimantrit, gemstones may be energised through traditional rituals as part of their spiritual preparation. It is a meaningful part of the journey, rather than a guarantee of any specific life outcome.",
+  },
+  {
+    question: "How do I choose the right Rudraksha?",
+    answer:
+      "Choosing a Rudraksha can depend on its Mukhi, traditional associations, and your personal spiritual or astrological journey. If you’re unsure which Rudraksha may be suitable for you, personalised astrology guidance can help you explore your options with greater clarity.",
+  },
+  {
+    question: "Can I get personalised guidance before buying?",
+    answer:
+      "Absolutely. If you’re unsure which gemstone or Rudraksha to choose, you can seek personalised guidance from Dr. Priyanka Singh. This can help you understand the different options and make a choice that feels more personal and meaningful.",
+  },
+];
+
+function normalizeFaqs(list) {
+  if (!Array.isArray(list)) return [];
+  return list
+    .map((item) => ({
+      question: String(item?.question || item?.q || "").trim(),
+      answer: String(item?.answer || item?.a || "").trim(),
+    }))
+    .filter((item) => item.question && item.answer);
+}
+
+async function readHomeFaqs() {
+  const page = await StorePage.findOne({ slug: HOME_FAQ_SLUG }).select("content").lean();
+  if (!page?.content) return DEFAULT_HOME_FAQS;
+  try {
+    const parsed = JSON.parse(page.content);
+    if (parsed && parsed.managed === true && Array.isArray(parsed.items)) {
+      const faqs = normalizeFaqs(parsed.items);
+      if (faqs.length) return faqs;
+    }
+  } catch (_error) {
+    return DEFAULT_HOME_FAQS;
+  }
+  return DEFAULT_HOME_FAQS;
+}
+
+async function writeHomeFaqs(faqs) {
+  await StorePage.findOneAndUpdate(
+    { slug: HOME_FAQ_SLUG },
+    {
+      $set: {
+        title: "Home FAQs",
+        content: JSON.stringify({ managed: true, items: faqs }),
+        isActive: true,
+      },
+      $setOnInsert: { slug: HOME_FAQ_SLUG },
+    },
+    { upsert: true }
+  );
+}
+
+const FEATURED_SLUG = "home-featured-finds";
+
+const DEFAULT_FEATURED = {
+  eyebrow: "Featured finds",
+  title: "Everyday Vibe, Purposeful Intention",
+  videoUrl: "",
+  imageUrl: "",
+  imageLabel: "Mind Peace",
+  points: [
+    "Authentically Sourced",
+    "Mindful Rituals",
+    "Positive Energy",
+    "Traditional Craftsmanship",
+  ],
+  ctaLabel: "Shop now",
+  ctaHref: "/product/gm-karungali-mala",
+};
+
+function removeFeaturedFile(fileUrl) {
+  if (!fileUrl || !String(fileUrl).startsWith("/uploads/featured/")) return;
+  const file = path.join(__dirname, "..", String(fileUrl).replace(/^\/+/, ""));
+  fs.unlink(file, () => {});
+}
+
+async function readFeaturedFinds() {
+  const page = await StorePage.findOne({ slug: FEATURED_SLUG }).select("content").lean();
+  let saved = {};
+  if (page?.content) {
+    try {
+      saved = JSON.parse(page.content) || {};
+    } catch (_error) {
+      saved = {};
+    }
+  }
+  const points = Array.isArray(saved.points)
+    ? saved.points.map((item) => String(item || "").trim()).filter(Boolean)
+    : DEFAULT_FEATURED.points;
+  return {
+    eyebrow: String(saved.eyebrow || DEFAULT_FEATURED.eyebrow),
+    title: String(saved.title || DEFAULT_FEATURED.title),
+    videoUrl: String(saved.videoUrl || ""),
+    imageUrl: String(saved.imageUrl || ""),
+    imageLabel: String(saved.imageLabel || DEFAULT_FEATURED.imageLabel),
+    points: points.length ? points : DEFAULT_FEATURED.points,
+    ctaLabel: String(saved.ctaLabel || DEFAULT_FEATURED.ctaLabel),
+    ctaHref: String(saved.ctaHref || DEFAULT_FEATURED.ctaHref),
+  };
+}
+
+async function writeFeaturedFinds(section) {
+  await StorePage.findOneAndUpdate(
+    { slug: FEATURED_SLUG },
+    {
+      $set: {
+        title: "Karungali mala",
+        content: JSON.stringify(section),
+        isActive: true,
+      },
+      $setOnInsert: { slug: FEATURED_SLUG },
+    },
+    { upsert: true }
+  );
+}
+
+router.get("/admin/featured-finds", async (_req, res) => {
+  try {
+    res.json({ success: true, data: await readFeaturedFinds() });
+  } catch (error) {
+    console.error("Load featured finds error:", error);
+    res.status(500).json({ success: false, message: "Failed to load Karungali section" });
+  }
+});
+
+router.put("/admin/featured-finds", (req, res) => {
+  uploadFeaturedMedia.fields([
+    { name: "video", maxCount: 1 },
+    { name: "image", maxCount: 1 },
+  ])(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      const current = await readFeaturedFinds();
+      const title = String(req.body?.title || "").trim();
+      if (!title) {
+        return res.status(400).json({ success: false, message: "Heading is required" });
+      }
+      const points = String(req.body?.points || "")
+        .split("|")
+        .map((item) => item.trim())
+        .filter(Boolean);
+      const video = req.files?.video?.[0];
+      const image = req.files?.image?.[0];
+      let videoUrl = current.videoUrl;
+      let imageUrl = current.imageUrl;
+      if (video) {
+        const next = `/uploads/featured/${video.filename}`;
+        if (videoUrl && videoUrl !== next) removeFeaturedFile(videoUrl);
+        videoUrl = next;
+      }
+      if (image) {
+        const next = `/uploads/featured/${image.filename}`;
+        if (imageUrl && imageUrl !== next) removeFeaturedFile(imageUrl);
+        imageUrl = next;
+      }
+      const section = {
+        eyebrow: String(req.body?.eyebrow || DEFAULT_FEATURED.eyebrow).trim(),
+        title,
+        videoUrl,
+        imageUrl,
+        imageLabel: String(req.body?.imageLabel || "").trim(),
+        points: points.length ? points : DEFAULT_FEATURED.points,
+        ctaLabel: String(req.body?.ctaLabel || DEFAULT_FEATURED.ctaLabel).trim(),
+        ctaHref: String(req.body?.ctaHref || DEFAULT_FEATURED.ctaHref).trim() || DEFAULT_FEATURED.ctaHref,
+      };
+      await writeFeaturedFinds(section);
+      res.json({ success: true, data: section });
+    } catch (error) {
+      console.error("Update featured finds error:", error);
+      res.status(500).json({ success: false, message: "Failed to update Karungali section" });
+    }
+  });
+});
+
+router.get("/admin/faqs", async (_req, res) => {
+  try {
+    const data = await readHomeFaqs();
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error("Load home FAQs error:", error);
+    res.status(500).json({ success: false, message: "Failed to load FAQs" });
+  }
+});
+
+router.put("/admin/faqs", async (req, res) => {
+  try {
+    const faqs = normalizeFaqs(req.body?.faqs);
+    if (!faqs.length) {
+      return res.status(400).json({ success: false, message: "Add at least one question and answer" });
+    }
+    await writeHomeFaqs(faqs);
+    res.json({ success: true, data: faqs });
+  } catch (error) {
+    console.error("Update home FAQs error:", error);
+    res.status(500).json({ success: false, message: "Failed to update FAQs" });
+  }
+});
+
+router.put("/admin/about/features/:id", (req, res) => {
+  uploadBannerImage.single("image")(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      const base = aboutFeatureById(req.params.id);
+      if (!base) {
+        if (req.file) removeBannerFile(`/uploads/banners/${req.file.filename}`);
+        return res.status(404).json({ success: false, message: "Point not found" });
+      }
+      const title = String(req.body?.title || "").trim();
+      const description = String(req.body?.description || "").trim();
+      if (!title || !description) {
+        if (req.file) removeBannerFile(`/uploads/banners/${req.file.filename}`);
+        return res.status(400).json({ success: false, message: "Title and description are required" });
+      }
+      const section = await readAboutSection();
+      const current = section.features.find((item) => item.id === base.id);
+      let image = current?.image || "";
+      if (req.file) {
+        const nextImage = `/uploads/banners/${req.file.filename}`;
+        if (image && image !== nextImage) removeBannerFile(image);
+        image = nextImage;
+      }
+      section.features = section.features.map((item) =>
+        item.id === base.id ? { ...item, title, description, image } : item
+      );
+      await writeAboutSection(section);
+      res.json({ success: true, data: section.features.find((item) => item.id === base.id) });
+    } catch (error) {
+      console.error("Update about feature error:", error);
+      res.status(500).json({ success: false, message: "Failed to update point" });
+    }
+  });
+});
+
+router.post("/admin/home-banners", (req, res) => {
+  uploadBannerImage.single("image")(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      const payload = readBannerFields(req.body, req.file);
+      if (!payload.title) {
+        removeBannerFile(payload.imageUrl);
+        return res.status(400).json({ success: false, message: "Headline is required" });
+      }
+      if (!payload.category) {
+        removeBannerFile(payload.imageUrl);
+        return res.status(400).json({ success: false, message: "Choose a category for the button" });
+      }
+      if (!req.file) {
+        return res.status(400).json({ success: false, message: "Banner image is required" });
+      }
+      const last = await StoreBanner.findOne({ key: HOME_SLIDER_KEY }).sort({ sortOrder: -1 }).select("sortOrder").lean();
+      if (!payload.sortOrder) payload.sortOrder = (last?.sortOrder || 0) + 1;
+      const banner = await StoreBanner.create(payload);
+      res.status(201).json({ success: true, data: banner });
+    } catch (error) {
+      console.error("Create home banner error:", error);
+      res.status(500).json({ success: false, message: "Failed to create banner" });
+    }
+  });
+});
+
+router.put("/admin/home-banners/:id", (req, res) => {
+  uploadBannerImage.single("image")(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      const existing = await StoreBanner.findOne({ _id: req.params.id, key: HOME_SLIDER_KEY });
+      if (!existing) {
+        if (req.file) removeBannerFile(`/uploads/banners/${req.file.filename}`);
+        return res.status(404).json({ success: false, message: "Banner not found" });
+      }
+      const payload = readBannerFields(req.body, req.file);
+      if (!payload.title) {
+        removeBannerFile(payload.imageUrl);
+        return res.status(400).json({ success: false, message: "Headline is required" });
+      }
+      if (!payload.category) {
+        removeBannerFile(payload.imageUrl);
+        return res.status(400).json({ success: false, message: "Choose a category for the button" });
+      }
+      if (!payload.sortOrder) payload.sortOrder = existing.sortOrder || 0;
+      if (req.file && existing.imageUrl && existing.imageUrl !== payload.imageUrl) {
+        removeBannerFile(existing.imageUrl);
+      }
+      Object.assign(existing, payload);
+      await existing.save();
+      res.json({ success: true, data: existing });
+    } catch (error) {
+      console.error("Update home banner error:", error);
+      res.status(500).json({ success: false, message: "Failed to update banner" });
+    }
+  });
+});
+
+router.delete("/admin/home-banners/:id", async (req, res) => {
+  try {
+    const banner = await StoreBanner.findOneAndDelete({ _id: req.params.id, key: HOME_SLIDER_KEY });
+    if (!banner) return res.status(404).json({ success: false, message: "Banner not found" });
+    removeBannerFile(banner.imageUrl);
+    res.json({ success: true, message: "Banner deleted" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to delete banner" });
   }
 });
 

@@ -4,8 +4,10 @@ const storeBannerSchema = new mongoose.Schema(
   {
     key: { type: String, default: "home-hero", index: true },
     title: { type: String, required: true },
+    titleLine2: { type: String, default: "" },
     subtitle: { type: String, default: "" },
     imageUrl: { type: String, default: "" },
+    category: { type: String, default: "" },
     ctaLabel: { type: String, default: "Shop Now" },
     ctaHref: { type: String, default: "/shop" },
     sortOrder: { type: Number, default: 0 },

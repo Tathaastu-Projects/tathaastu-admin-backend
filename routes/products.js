@@ -133,6 +133,12 @@ function normalizeProductPayload(body = {}) {
     },
     linkedRemedyId: body.linkedRemedyId || null,
     linkedRemedyName: String(body.linkedRemedyName || "").trim(),
+    hoverDetails: Array.isArray(body.hoverDetails)
+      ? body.hoverDetails
+          .map((item) => ({ label: String(item?.label || "").trim() }))
+          .filter((item) => item.label)
+          .slice(0, 8)
+      : [],
   };
 }
 

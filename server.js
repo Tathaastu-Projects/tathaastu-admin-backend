@@ -4,6 +4,7 @@ require("dotenv").config({ path: path.join(__dirname, ".env") });
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
+const { streamStoredFile, importUploadFolder } = require("./lib/storedFiles");
 
 const app = express();
 
@@ -11,6 +12,17 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
+app.use("/uploads", (req, res, next) => {
+  if (req.method !== "GET" && req.method !== "HEAD") return next();
+  const filename = path.basename(decodeURIComponent(req.path || ""));
+  streamStoredFile(filename, req, res)
+    .then((sent) => {
+      if (!sent && !res.headersSent) next();
+    })
+    .catch(() => {
+      if (!res.headersSent) next();
+    });
+});
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 // MongoDB Connection
@@ -22,7 +34,14 @@ const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/tathas
 
 mongoose
   .connect(MONGODB_URI)
-  .then(() => console.log("✅ MongoDB connected successfully"))
+  .then(async () => {
+    console.log("✅ MongoDB connected successfully");
+    const uploadsRoot = path.join(__dirname, "uploads");
+    const added = await importUploadFolder(path.join(uploadsRoot, "banners"))
+      + await importUploadFolder(path.join(uploadsRoot, "products"))
+      + await importUploadFolder(path.join(uploadsRoot, "featured"));
+    if (added) console.log(`Stored ${added} upload file(s) in MongoDB`);
+  })
   .catch((err) => console.error("❌ MongoDB connection error:", err));
 
 // Routes

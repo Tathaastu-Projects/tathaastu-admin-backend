@@ -1,19 +1,49 @@
 const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
+const { saveLocalFile, deleteStoredFile } = require("../lib/storedFiles");
 
 const uploadRoot = path.join(__dirname, "..", "uploads", "products");
 fs.mkdirSync(uploadRoot, { recursive: true });
 
-const storage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, uploadRoot),
-  filename: (_req, file, cb) => {
-    const safe = String(file.originalname || "image")
-      .toLowerCase()
-      .replace(/[^a-z0-9.]+/g, "-");
-    cb(null, `${Date.now()}-${safe}`);
-  },
-});
+function mongoDiskStorage(rootDir) {
+  return {
+    _handleFile(_req, file, cb) {
+      fs.mkdirSync(rootDir, { recursive: true });
+      const safe = String(file.originalname || "file")
+        .toLowerCase()
+        .replace(/[^a-z0-9.]+/g, "-");
+      const filename = `${Date.now()}-${safe}`;
+      const fullPath = path.join(rootDir, filename);
+      const out = fs.createWriteStream(fullPath);
+      file.stream.pipe(out);
+      out.on("error", cb);
+      out.on("finish", () => {
+        saveLocalFile(filename, fullPath, file.mimetype)
+          .then(() => {
+            cb(null, {
+              destination: rootDir,
+              filename,
+              path: fullPath,
+              size: out.bytesWritten,
+            });
+          })
+          .catch((error) => {
+            fs.unlink(fullPath, () => {});
+            cb(error);
+          });
+      });
+    },
+    _removeFile(_req, file, cb) {
+      if (file.path) fs.unlink(file.path, () => {});
+      deleteStoredFile(file.filename)
+        .catch(() => {})
+        .finally(() => cb(null));
+    },
+  };
+}
+
+const storage = mongoDiskStorage(uploadRoot);
 
 function fileFilter(_req, file, cb) {
   if (!file.mimetype?.startsWith("image/")) {
@@ -31,15 +61,7 @@ const uploadProductImages = multer({
 const bannerRoot = path.join(__dirname, "..", "uploads", "banners");
 fs.mkdirSync(bannerRoot, { recursive: true });
 
-const bannerStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, bannerRoot),
-  filename: (_req, file, cb) => {
-    const safe = String(file.originalname || "banner")
-      .toLowerCase()
-      .replace(/[^a-z0-9.]+/g, "-");
-    cb(null, `${Date.now()}-${safe}`);
-  },
-});
+const bannerStorage = mongoDiskStorage(bannerRoot);
 
 function bannerFileFilter(_req, file, cb) {
   const name = String(file.originalname || "");
@@ -57,15 +79,7 @@ const uploadBannerImage = multer({
 const featuredRoot = path.join(__dirname, "..", "uploads", "featured");
 fs.mkdirSync(featuredRoot, { recursive: true });
 
-const featuredStorage = multer.diskStorage({
-  destination: (_req, _file, cb) => cb(null, featuredRoot),
-  filename: (_req, file, cb) => {
-    const safe = String(file.originalname || "file")
-      .toLowerCase()
-      .replace(/[^a-z0-9.]+/g, "-");
-    cb(null, `${Date.now()}-${safe}`);
-  },
-});
+const featuredStorage = mongoDiskStorage(featuredRoot);
 
 function featuredFileFilter(_req, file, cb) {
   const name = String(file.originalname || "");

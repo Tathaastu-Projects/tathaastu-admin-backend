@@ -14,6 +14,7 @@ const { findValidCoupon, computeCouponDiscount } = require("../lib/storeCoupons"
 const { signCustomerToken, optionalStoreAuth, requireStoreAuth } = require("../middleware/storeAuth");
 const { restoreStock } = require("../lib/storeStock");
 const { uploadBannerImage, uploadFeaturedMedia } = require("../middleware/upload");
+const { deleteStoredFile } = require("../lib/storedFiles");
 const { HERO_CATEGORIES, HOME_SLIDER_KEY, categoryById } = require("../lib/heroCategories");
 const { CATEGORY_TILES, TILE_SLUG, tileById } = require("../lib/categoryTiles");
 const {
@@ -777,6 +778,7 @@ function removeBannerFile(imageUrl) {
   if (!imageUrl || !String(imageUrl).startsWith("/uploads/banners/")) return;
   const file = path.join(__dirname, "..", String(imageUrl).replace(/^\/+/, ""));
   fs.unlink(file, () => {});
+  deleteStoredFile(path.basename(String(imageUrl))).catch(() => {});
 }
 
 function readBannerFields(body, file) {
@@ -1123,6 +1125,7 @@ function removeFeaturedFile(fileUrl) {
   if (!fileUrl || !String(fileUrl).startsWith("/uploads/featured/")) return;
   const file = path.join(__dirname, "..", String(fileUrl).replace(/^\/+/, ""));
   fs.unlink(file, () => {});
+  deleteStoredFile(path.basename(String(fileUrl))).catch(() => {});
 }
 
 async function readFeaturedFinds() {

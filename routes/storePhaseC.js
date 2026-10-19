@@ -936,6 +936,32 @@ router.put("/admin/category-tiles/:id", (req, res) => {
   });
 });
 
+async function aboutMedia(current, body, file) {
+  let image = String(current?.image || "");
+  const pasted = String(body?.imageUrl || "").trim();
+  if (file) {
+    const nextImage = `/uploads/banners/${file.filename}`;
+    if (image !== nextImage) removeBannerFile(image);
+    image = nextImage;
+  } else if (pasted) {
+    if (image !== pasted) removeBannerFile(image);
+    image = pasted;
+  } else if (/^https?:\/\//i.test(image)) {
+    image = String(current?.fallbackImage || "");
+  }
+
+  const videoUrl = String(body?.videoUrl || "").trim();
+  let playbackUrl = String(current?.playbackUrl || "");
+  if (!videoUrl) {
+    if (playbackUrl) removeTestimonialVideo(playbackUrl);
+    playbackUrl = "";
+  } else if (videoUrl !== String(current?.videoUrl || "") || !playbackUrl) {
+    if (playbackUrl) removeTestimonialVideo(playbackUrl);
+    playbackUrl = await prepareTestimonialVideo(videoUrl);
+  }
+  return { image, videoUrl, playbackUrl };
+}
+
 async function readAboutSection() {
   const page = await StorePage.findOne({ slug: ABOUT_SLUG }).select("content").lean();
   let saved = {};
@@ -949,17 +975,24 @@ async function readAboutSection() {
   const savedFeatures = Array.isArray(saved.features) ? saved.features : [];
   const byId = Object.fromEntries(savedFeatures.map((item) => [item.id, item]));
   return {
-    image: String(saved.image || ABOUT_IMAGE),
+    image: String(saved.image || "").includes("/about/abhimantrit-banner") ? "" : String(saved.image || ABOUT_IMAGE),
+    imageUrl: /^https?:\/\//i.test(String(saved.image || "")) ? String(saved.image) : "",
+    videoUrl: String(saved.videoUrl || ""),
+    playbackUrl: String(saved.playbackUrl || ""),
     intro: String(saved.intro || ABOUT_INTRO),
     width: ABOUT_WIDTH,
     height: ABOUT_HEIGHT,
     features: ABOUT_FEATURES.map((item) => {
       const custom = byId[item.id] || {};
+      const image = String(custom.image || item.image || "");
       return {
         ...item,
         title: String(custom.title || item.title),
         description: String(custom.description || item.description),
-        image: String(custom.image || item.image || ""),
+        image,
+        imageUrl: /^https?:\/\//i.test(image) ? image : "",
+        videoUrl: String(custom.videoUrl || ""),
+        playbackUrl: String(custom.playbackUrl || ""),
       };
     }),
   };
@@ -973,12 +1006,16 @@ async function writeAboutSection(section) {
         title: "About Abhimantrit",
         content: JSON.stringify({
           image: section.image,
+          videoUrl: section.videoUrl || "",
+          playbackUrl: section.playbackUrl || "",
           intro: section.intro,
           features: section.features.map((item) => ({
             id: item.id,
             title: item.title,
             description: item.description,
             image: item.image || "",
+            videoUrl: item.videoUrl || "",
+            playbackUrl: item.playbackUrl || "",
           })),
         }),
         isActive: true,
@@ -1011,17 +1048,20 @@ router.put("/admin/about", (req, res) => {
         return res.status(400).json({ success: false, message: "Intro text is required" });
       }
       const section = await readAboutSection();
-      if (req.file) {
-        const nextImage = `/uploads/banners/${req.file.filename}`;
-        if (section.image !== nextImage) removeBannerFile(section.image);
-        section.image = nextImage;
-      }
+      const media = await aboutMedia(
+        { ...section, fallbackImage: ABOUT_IMAGE },
+        req.body,
+        req.file,
+      );
+      section.image = media.image && !String(media.image).includes("/about/abhimantrit-banner") ? media.image : "";
+      section.videoUrl = media.videoUrl;
+      section.playbackUrl = media.playbackUrl;
       section.intro = intro;
       await writeAboutSection(section);
       res.json({ success: true, data: section });
     } catch (error) {
       console.error("Update about section error:", error);
-      res.status(500).json({ success: false, message: "Failed to update about section" });
+      res.status(500).json({ success: false, message: error.message || "Failed to update about section" });
     }
   });
 });
@@ -1261,7 +1301,26 @@ async function prepareTestimonialVideo(videoUrl) {
     output,
   ]);
   fs.unlink(source, () => {});
+  const posterName = filename.replace(/\.mp4$/, ".jpg");
+  const posterPath = path.join(dir, posterName);
+  await runFfmpeg([
+    "-y",
+    "-ss",
+    "0.2",
+    "-i",
+    output,
+    "-frames:v",
+    "1",
+    "-update",
+    "1",
+    "-vf",
+    "scale='min(960,iw)':-2",
+    "-q:v",
+    "5",
+    posterPath,
+  ]);
   await saveLocalFile(filename, output, "video/mp4");
+  await saveLocalFile(posterName, posterPath, "image/jpeg");
   return `/uploads/testimonials/${filename}`;
 }
 
@@ -1497,20 +1556,24 @@ router.put("/admin/about/features/:id", (req, res) => {
       }
       const section = await readAboutSection();
       const current = section.features.find((item) => item.id === base.id);
-      let image = current?.image || "";
-      if (req.file) {
-        const nextImage = `/uploads/banners/${req.file.filename}`;
-        if (image && image !== nextImage) removeBannerFile(image);
-        image = nextImage;
-      }
+      const media = await aboutMedia({ ...current, fallbackImage: "" }, req.body, req.file);
       section.features = section.features.map((item) =>
-        item.id === base.id ? { ...item, title, description, image } : item
+        item.id === base.id
+          ? {
+              ...item,
+              title,
+              description,
+              image: media.image,
+              videoUrl: media.videoUrl,
+              playbackUrl: media.playbackUrl,
+            }
+          : item
       );
       await writeAboutSection(section);
       res.json({ success: true, data: section.features.find((item) => item.id === base.id) });
     } catch (error) {
       console.error("Update about feature error:", error);
-      res.status(500).json({ success: false, message: "Failed to update point" });
+      res.status(500).json({ success: false, message: error.message || "Failed to update point" });
     }
   });
 });

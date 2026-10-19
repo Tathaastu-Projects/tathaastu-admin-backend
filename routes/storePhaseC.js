@@ -13,8 +13,10 @@ const { StoreBanner, StoreBlogPost, StorePage } = require("../models/StoreCms");
 const { findValidCoupon, computeCouponDiscount } = require("../lib/storeCoupons");
 const { signCustomerToken, optionalStoreAuth, requireStoreAuth } = require("../middleware/storeAuth");
 const { restoreStock } = require("../lib/storeStock");
-const { uploadBannerImage, uploadFeaturedMedia } = require("../middleware/upload");
-const { deleteStoredFile } = require("../lib/storedFiles");
+const { uploadBannerImage, uploadFeaturedMedia, uploadTestimonialImages } = require("../middleware/upload");
+const { execFile } = require("child_process");
+const https = require("https");
+const { deleteStoredFile, saveLocalFile } = require("../lib/storedFiles");
 const { HERO_CATEGORIES, HOME_SLIDER_KEY, categoryById } = require("../lib/heroCategories");
 const { CATEGORY_TILES, TILE_SLUG, tileById } = require("../lib/categoryTiles");
 const {
@@ -657,6 +659,7 @@ router.get("/content/home", async (_req, res) => {
         categoryTiles: await readCategoryTiles(),
         aboutSection: await readAboutSection(),
         featuredFinds: await readFeaturedFinds(),
+        testimonials: await readTestimonials(),
         trustBadges: [
           { id: "authentic", label: "Authentic & Certified", description: "Curated listed products" },
           { id: "ship", label: "Free Shipping", description: "On eligible orders" },
@@ -1103,6 +1106,229 @@ async function writeHomeFaqs(faqs) {
   );
 }
 
+const TESTIMONIAL_SLUG = "home-testimonials";
+
+const DEFAULT_TESTIMONIALS = [
+  {
+    quote:
+      "Ordered the wrong bracelet accidentally, the team was nice and supportive and helped replace the order with the new one within 7 days! Such a smooth experience, really happy with my tiger eye bracelet.",
+    name: "Maanya",
+    imageUrl: "",
+  },
+];
+
+function readTestimonials() {
+  return StorePage.findOne({ slug: TESTIMONIAL_SLUG })
+    .select("content")
+    .lean()
+    .then((page) => {
+      if (!page?.content) return DEFAULT_TESTIMONIALS;
+      try {
+        const saved = JSON.parse(page.content);
+        const items = Array.isArray(saved?.items) ? saved.items : [];
+        const clean = items
+          .map((item) => ({
+            quote: String(item?.quote || "").trim(),
+            name: String(item?.name || "").trim(),
+            imageUrl: String(item?.imageUrl || "").trim(),
+            videoUrl: String(item?.videoUrl || "").trim(),
+            playbackUrl: String(item?.playbackUrl || "").trim(),
+          }))
+          .filter((item) => item.quote && item.name);
+        return clean.length ? clean : DEFAULT_TESTIMONIALS;
+      } catch (_error) {
+        return DEFAULT_TESTIMONIALS;
+      }
+    });
+}
+
+async function writeTestimonials(items) {
+  await StorePage.findOneAndUpdate(
+    { slug: TESTIMONIAL_SLUG },
+    {
+      $set: {
+        title: "Testimonials",
+        content: JSON.stringify({ items }),
+        isActive: true,
+      },
+      $setOnInsert: { slug: TESTIMONIAL_SLUG },
+    },
+    { upsert: true }
+  );
+}
+
+router.get("/admin/testimonials", async (_req, res) => {
+  try {
+    res.json({ success: true, data: await readTestimonials() });
+  } catch (error) {
+    console.error("Load testimonials error:", error);
+    res.status(500).json({ success: false, message: "Failed to load testimonials" });
+  }
+});
+
+function driveFileId(url) {
+  const file = String(url).match(/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)/);
+  if (file) return file[1];
+  if (!/drive\.google\.com|googleusercontent\.com/.test(url)) return "";
+  const id = String(url).match(/[?&]id=([a-zA-Z0-9_-]+)/);
+  return id ? id[1] : "";
+}
+
+function downloadToFile(url, dest, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    if (redirects > 5) {
+      reject(new Error("Video download redirected too many times"));
+      return;
+    }
+    const request = https.get(url, (response) => {
+      const location = response.headers.location;
+      if (response.statusCode >= 300 && response.statusCode < 400 && location) {
+        response.resume();
+        downloadToFile(location, dest, redirects + 1).then(resolve, reject);
+        return;
+      }
+      if (response.statusCode !== 200) {
+        response.resume();
+        reject(new Error("Could not download that video. Share the Drive file as Anyone with the link."));
+        return;
+      }
+      const file = fs.createWriteStream(dest);
+      response.pipe(file);
+      file.on("finish", () => file.close(() => resolve()));
+      file.on("error", reject);
+    });
+    request.on("error", reject);
+  });
+}
+
+function runFfmpeg(args) {
+  return new Promise((resolve, reject) => {
+    execFile("ffmpeg", args, { timeout: 180000 }, (error, _stdout, stderr) => {
+      if (error) reject(new Error(stderr || error.message));
+      else resolve();
+    });
+  });
+}
+
+function removeTestimonialVideo(fileUrl) {
+  if (!fileUrl || !String(fileUrl).startsWith("/uploads/testimonials/")) return;
+  const file = path.join(__dirname, "..", String(fileUrl).replace(/^\/+/, ""));
+  fs.unlink(file, () => {});
+  deleteStoredFile(path.basename(String(fileUrl))).catch(() => {});
+}
+
+async function prepareTestimonialVideo(videoUrl) {
+  const directMp4 = /\.mp4($|\?)/i.test(videoUrl) && !driveFileId(videoUrl);
+  if (directMp4) return videoUrl;
+  const id = driveFileId(videoUrl) || crypto.randomBytes(6).toString("hex");
+  const filename = `${id}.mp4`;
+  const dir = path.join(__dirname, "..", "uploads", "testimonials");
+  fs.mkdirSync(dir, { recursive: true });
+  const source = path.join(dir, `${id}-source`);
+  const output = path.join(dir, filename);
+  const remote = driveFileId(videoUrl)
+    ? `https://drive.usercontent.google.com/download?id=${driveFileId(videoUrl)}&export=download`
+    : videoUrl;
+  if (!/^https:\/\//i.test(remote)) {
+    throw new Error("Paste a public https video link");
+  }
+  await downloadToFile(remote, source);
+  const size = fs.statSync(source).size;
+  if (size > 80 * 1024 * 1024) {
+    fs.unlink(source, () => {});
+    throw new Error("Video is larger than 80 MB");
+  }
+  await runFfmpeg([
+    "-y",
+    "-i",
+    source,
+    "-vf",
+    "scale='min(960,iw)':-2",
+    "-c:v",
+    "libx264",
+    "-preset",
+    "veryfast",
+    "-crf",
+    "23",
+    "-pix_fmt",
+    "yuv420p",
+    "-c:a",
+    "aac",
+    "-b:a",
+    "128k",
+    "-movflags",
+    "+faststart",
+    output,
+  ]);
+  fs.unlink(source, () => {});
+  await saveLocalFile(filename, output, "video/mp4");
+  return `/uploads/testimonials/${filename}`;
+}
+
+router.put("/admin/testimonials", (req, res) => {
+  uploadTestimonialImages.any()(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      const current = await readTestimonials();
+      let incoming = [];
+      try {
+        incoming = JSON.parse(req.body?.items || "[]");
+      } catch (_error) {
+        incoming = [];
+      }
+      if (!Array.isArray(incoming) || !incoming.length) {
+        return res.status(400).json({ success: false, message: "Add at least one testimonial" });
+      }
+      const files = Array.isArray(req.files) ? req.files : [];
+      const items = [];
+      for (let index = 0; index < incoming.length; index += 1) {
+        const item = incoming[index];
+        const quote = String(item?.quote || "").trim();
+        const name = String(item?.name || "").trim();
+        if (!quote || !name) continue;
+        const file = files.find((entry) => entry.fieldname === `image_${index}`);
+        let imageUrl = String(item?.imageUrl || "").trim();
+        const videoUrl = String(item?.videoUrl || "").trim();
+        if (file) {
+          const next = `/uploads/banners/${file.filename}`;
+          if (imageUrl && imageUrl !== next) removeBannerFile(imageUrl);
+          imageUrl = next;
+        }
+        const previous = current.find((row) => row.videoUrl === videoUrl && row.playbackUrl);
+        let playbackUrl = "";
+        if (videoUrl) {
+          const reused = previous?.playbackUrl || "";
+          const reusedFile = reused.startsWith("/uploads/testimonials/")
+            ? path.join(__dirname, "..", reused.replace(/^\/+/, ""))
+            : "";
+          if (reused && (!reusedFile || fs.existsSync(reusedFile))) {
+            playbackUrl = reused;
+          } else {
+            playbackUrl = await prepareTestimonialVideo(videoUrl);
+          }
+        }
+        items.push({ quote, name, imageUrl, videoUrl, playbackUrl });
+      }
+      if (!items.length) {
+        return res.status(400).json({ success: false, message: "Each testimonial needs a quote and a name" });
+      }
+      const kept = new Set(items.map((item) => item.imageUrl));
+      const keptVideos = new Set(items.map((item) => item.playbackUrl));
+      current.forEach((item) => {
+        if (item.imageUrl && !kept.has(item.imageUrl)) removeBannerFile(item.imageUrl);
+        if (item.playbackUrl && !keptVideos.has(item.playbackUrl)) removeTestimonialVideo(item.playbackUrl);
+      });
+      await writeTestimonials(items);
+      res.json({ success: true, data: items });
+    } catch (error) {
+      console.error("Update testimonials error:", error);
+      res.status(500).json({ success: false, message: "Failed to save testimonials" });
+    }
+  });
+});
+
 const FEATURED_SLUG = "home-featured-finds";
 
 const DEFAULT_FEATURED = {
@@ -1361,6 +1587,91 @@ router.delete("/admin/home-banners/:id", async (req, res) => {
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to delete banner" });
   }
+});
+
+router.get("/admin/home-blogs", async (_req, res) => {
+  try {
+    const posts = await StoreBlogPost.find({ status: "published" })
+      .sort({ publishedAt: -1 })
+      .limit(6)
+      .select("title slug coverImage videoUrl playbackUrl tags publishedAt")
+      .lean();
+    res.json({ success: true, data: posts });
+  } catch (error) {
+    console.error("Load home blogs error:", error);
+    res.status(500).json({ success: false, message: "Failed to load blog cards" });
+  }
+});
+
+router.put("/admin/home-blogs", (req, res) => {
+  uploadTestimonialImages.any()(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      let incoming = [];
+      try {
+        incoming = JSON.parse(req.body?.items || "[]");
+      } catch (_error) {
+        incoming = [];
+      }
+      if (!Array.isArray(incoming) || !incoming.length) {
+        return res.status(400).json({ success: false, message: "No blog cards to update" });
+      }
+      const files = Array.isArray(req.files) ? req.files : [];
+      const saved = [];
+      for (let index = 0; index < incoming.length; index += 1) {
+        const item = incoming[index];
+        const id = String(item?._id || "").trim();
+        if (!id) continue;
+        const post = await StoreBlogPost.findById(id);
+        if (!post) continue;
+        const file = files.find((entry) => entry.fieldname === `image_${index}`);
+        let coverImage = String(item?.coverImage || "").trim();
+        const videoUrl = String(item?.videoUrl || "").trim();
+        if (file) {
+          const next = `/uploads/banners/${file.filename}`;
+          if (coverImage && coverImage !== next) removeBannerFile(coverImage);
+          coverImage = next;
+        } else if (post.coverImage && post.coverImage !== coverImage) {
+          removeBannerFile(post.coverImage);
+        }
+        let playbackUrl = "";
+        if (videoUrl) {
+          const sameVideo = post.videoUrl === videoUrl && post.playbackUrl;
+          const reusedFile = String(post.playbackUrl || "").startsWith("/uploads/testimonials/")
+            ? path.join(__dirname, "..", String(post.playbackUrl).replace(/^\/+/, ""))
+            : "";
+          if (sameVideo && (!reusedFile || fs.existsSync(reusedFile))) {
+            playbackUrl = post.playbackUrl;
+          } else {
+            if (post.playbackUrl && post.playbackUrl !== playbackUrl) removeTestimonialVideo(post.playbackUrl);
+            playbackUrl = await prepareTestimonialVideo(videoUrl);
+          }
+        } else if (post.playbackUrl) {
+          removeTestimonialVideo(post.playbackUrl);
+        }
+        post.coverImage = coverImage;
+        post.videoUrl = videoUrl;
+        post.playbackUrl = playbackUrl;
+        await post.save();
+        saved.push({
+          _id: post._id,
+          title: post.title,
+          slug: post.slug,
+          coverImage: post.coverImage,
+          videoUrl: post.videoUrl,
+          playbackUrl: post.playbackUrl,
+          tags: post.tags,
+          publishedAt: post.publishedAt,
+        });
+      }
+      res.json({ success: true, data: saved });
+    } catch (error) {
+      console.error("Update home blogs error:", error);
+      res.status(500).json({ success: false, message: error.message || "Failed to save blog cards" });
+    }
+  });
 });
 
 router.post("/admin/blogs", async (req, res) => {

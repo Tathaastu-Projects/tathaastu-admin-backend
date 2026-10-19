@@ -23,6 +23,8 @@ const storeBlogPostSchema = new mongoose.Schema(
     excerpt: { type: String, default: "" },
     content: { type: String, default: "" },
     coverImage: { type: String, default: "" },
+    videoUrl: { type: String, default: "" },
+    playbackUrl: { type: String, default: "" },
     tags: { type: [String], default: [] },
     author: { type: String, default: "Tathaastu" },
     status: { type: String, enum: ["draft", "published"], default: "published", index: true },

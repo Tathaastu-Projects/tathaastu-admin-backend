@@ -76,6 +76,12 @@ const uploadBannerImage = multer({
   limits: { fileSize: 8 * 1024 * 1024, files: 1 },
 });
 
+const uploadTestimonialImages = multer({
+  storage: bannerStorage,
+  fileFilter: bannerFileFilter,
+  limits: { fileSize: 8 * 1024 * 1024, files: 20 },
+});
+
 const featuredRoot = path.join(__dirname, "..", "uploads", "featured");
 fs.mkdirSync(featuredRoot, { recursive: true });
 
@@ -98,6 +104,7 @@ const uploadFeaturedMedia = multer({
 module.exports = {
   uploadProductImages,
   uploadBannerImage,
+  uploadTestimonialImages,
   uploadFeaturedMedia,
   uploadRoot,
   bannerRoot,

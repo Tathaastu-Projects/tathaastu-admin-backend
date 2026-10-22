@@ -12,10 +12,28 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
+// Serve local files first with express.static for zero-latency video streaming, byte ranges, and HTTP caching
+const uploadsDir = path.join(__dirname, "uploads");
+app.use(
+  "/uploads",
+  express.static(uploadsDir, {
+    maxAge: "365d",
+    immutable: true,
+    setHeaders: (res, filePath) => {
+      res.setHeader("Access-Control-Allow-Origin", "*");
+      res.setHeader("Accept-Ranges", "bytes");
+      if (filePath.endsWith(".mp4")) {
+        res.setHeader("Content-Type", "video/mp4");
+      }
+    },
+  })
+);
+
+// Fallback to MongoDB GridFS if file doesn't exist on local disk yet
 app.use("/uploads", (req, res, next) => {
   if (req.method !== "GET" && req.method !== "HEAD") return next();
   const filename = path.basename(decodeURIComponent(req.path || ""));
-  streamStoredFile(filename, req, res)
+  streamStoredFile(filename, req, res, req.path)
     .then((sent) => {
       if (!sent && !res.headersSent) next();
     })
@@ -23,7 +41,6 @@ app.use("/uploads", (req, res, next) => {
       if (!res.headersSent) next();
     });
 });
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 // MongoDB Connection
 // mongodb+srv:// needs DNS SRV lookups. Some ISP resolvers return ESERVFAIL /

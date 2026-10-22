@@ -9,15 +9,40 @@ const router = express.Router();
 
 const INTENTIONS = ["Peace", "Wealth", "Health", "Protection", "Relationship", "Success", "Spirituality"];
 const CATEGORIES = [
+  "crystal-bracelets",
   "rudraksha",
-  "crystal",
-  "stone",
-  "gemstone",
-  "yantra",
-  "bracelet",
-  "combo",
+  "crystal-anklets",
+  "tumbles",
+  "crystal-trees",
+  "pyramids",
+  "loose-stones",
+  "mala",
+  "photo-frames",
   "other",
 ];
+
+const LEGACY_CATEGORY_MAP = {
+  bracelet: "crystal-bracelets",
+  bracelets: "crystal-bracelets",
+  gemstone: "loose-stones",
+  gemstones: "loose-stones",
+  stone: "loose-stones",
+  stones: "loose-stones",
+  crystal: "tumbles",
+  yantra: "photo-frames",
+  combo: "crystal-bracelets",
+};
+
+function normalizeCategory(val) {
+  if (!val) return "crystal-bracelets";
+  const str = String(val).trim().toLowerCase();
+  const slug = str.replace(/['’]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "");
+  if (CATEGORIES.includes(slug)) return slug;
+  if (CATEGORIES.includes(str)) return str;
+  if (LEGACY_CATEGORY_MAP[slug]) return LEGACY_CATEGORY_MAP[slug];
+  if (LEGACY_CATEGORY_MAP[str]) return LEGACY_CATEGORY_MAP[str];
+  return "crystal-bracelets";
+}
 
 function slugify(value) {
   return String(value || "")
@@ -92,7 +117,7 @@ function normalizeProductPayload(body = {}) {
     sku: String(body.sku || "").trim(),
     shortDescription: String(body.shortDescription || "").trim(),
     description: String(body.description || "").trim(),
-    category: CATEGORIES.includes(body.category) ? body.category : "other",
+    category: normalizeCategory(body.category),
     images,
     mrp: Number(body.mrp) || 0,
     salePrice: Number(body.salePrice) || 0,

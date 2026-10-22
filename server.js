@@ -40,7 +40,8 @@ mongoose
     const added = await importUploadFolder(path.join(uploadsRoot, "banners"))
       + await importUploadFolder(path.join(uploadsRoot, "products"))
       + await importUploadFolder(path.join(uploadsRoot, "featured"))
-      + await importUploadFolder(path.join(uploadsRoot, "testimonials"));
+      + await importUploadFolder(path.join(uploadsRoot, "testimonials"))
+      + await importUploadFolder(path.join(uploadsRoot, "reels"));
     if (added) console.log(`Stored ${added} upload file(s) in MongoDB`);
   })
   .catch((err) => console.error("❌ MongoDB connection error:", err));

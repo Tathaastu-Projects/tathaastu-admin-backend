@@ -13,7 +13,7 @@ const { StoreBanner, StoreBlogPost, StorePage } = require("../models/StoreCms");
 const { findValidCoupon, computeCouponDiscount } = require("../lib/storeCoupons");
 const { signCustomerToken, optionalStoreAuth, requireStoreAuth } = require("../middleware/storeAuth");
 const { restoreStock } = require("../lib/storeStock");
-const { uploadBannerImage, uploadFeaturedMedia, uploadTestimonialImages } = require("../middleware/upload");
+const { uploadBannerImage, uploadFeaturedMedia, uploadTestimonialImages, uploadReelsMedia } = require("../middleware/upload");
 const { execFile } = require("child_process");
 const https = require("https");
 const { deleteStoredFile, saveLocalFile } = require("../lib/storedFiles");
@@ -617,7 +617,7 @@ router.get("/content/home", async (_req, res) => {
         .lean();
       categoryCards.push({
         id: cat,
-        label: cat.charAt(0).toUpperCase() + cat.slice(1),
+        label: categoryById(cat)?.label || cat.split("-").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" "),
         href: `/shop/${cat}`,
         productCount: countMap[cat] || 0,
         image:
@@ -659,6 +659,7 @@ router.get("/content/home", async (_req, res) => {
         categoryTiles: await readCategoryTiles(),
         aboutSection: await readAboutSection(),
         featuredFinds: await readFeaturedFinds(),
+        screenToSpace: await readScreenToSpace(),
         testimonials: await readTestimonials(),
         trustBadges: [
           { id: "authentic", label: "Authentic & Certified", description: "Curated listed products" },
@@ -1512,6 +1513,205 @@ router.put("/admin/featured-finds", (req, res) => {
     }
   });
 });
+
+/* ------------------------ Screen to Space (Shoppable Reels) ------------------------ */
+
+const SCREEN_TO_SPACE_SLUG = "home-screen-to-space";
+
+const DEFAULT_SCREEN_TO_SPACE = {
+  title: "from screen to space, seamlessly",
+  subtitle: "",
+  isActive: true,
+  items: [
+    {
+      id: "reel-1",
+      overlayTag: "",
+      videoUrl: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+      imageUrl: "https://images.unsplash.com/photo-1544787219-7f47ccb76574?w=800&q=80",
+      productTitle: "Arra Brass Tea Pan With Wooden Handle",
+      productPrice: 4581,
+      productImage: "https://images.unsplash.com/photo-1544787219-7f47ccb76574?w=300&q=80",
+      productSlug: "arra-brass-tea-pan-with-wooden-handle",
+      buttonText: "SHOP NOW",
+      dotsCount: 4,
+      isActive: true,
+    },
+    {
+      id: "reel-2",
+      overlayTag: "",
+      videoUrl: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4",
+      imageUrl: "https://images.unsplash.com/photo-1608755728617-aefab37d2edd?w=800&q=80",
+      productTitle: "Kanchdeep Diya Set of 24",
+      productPrice: 1690,
+      productImage: "https://images.unsplash.com/photo-1608755728617-aefab37d2edd?w=300&q=80",
+      productSlug: "kanchdeep-diya-set-of-24",
+      buttonText: "SHOP NOW",
+      dotsCount: 4,
+      isActive: true,
+    },
+    {
+      id: "reel-3",
+      overlayTag: "",
+      videoUrl: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4",
+      imageUrl: "https://images.unsplash.com/photo-1578749556568-bc2c40e68b61?w=800&q=80",
+      productTitle: "Fiore Ceramic Serving Bowl",
+      productPrice: 2150,
+      productImage: "https://images.unsplash.com/photo-1578749556568-bc2c40e68b61?w=300&q=80",
+      productSlug: "fiore-ceramic-serving-bowl",
+      buttonText: "SHOP NOW",
+      dotsCount: 4,
+      isActive: true,
+    },
+    {
+      id: "reel-4",
+      overlayTag: "1. Beal Gond Katira cooler",
+      videoUrl: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyBlazes.mp4",
+      imageUrl: "https://images.unsplash.com/photo-1513558161293-cdaf765ed2fd?w=800&q=80",
+      productTitle: "Dewy Glass Jug With Wooden Lid",
+      productPrice: 2508,
+      productImage: "https://images.unsplash.com/photo-1513558161293-cdaf765ed2fd?w=300&q=80",
+      productSlug: "dewy-glass-jug-with-wooden-lid",
+      buttonText: "SHOP NOW",
+      dotsCount: 4,
+      isActive: true,
+    },
+    {
+      id: "reel-5",
+      overlayTag: "",
+      videoUrl: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/WeAreGoingOnBullrun.mp4",
+      imageUrl: "https://images.unsplash.com/photo-1611652022419-a9419f74343d?w=800&q=80",
+      productTitle: "Handcrafted Brass Dhoop Dani & Lamp",
+      productPrice: 1850,
+      productImage: "https://images.unsplash.com/photo-1611652022419-a9419f74343d?w=300&q=80",
+      productSlug: "handcrafted-brass-dhoop-dani-lamp",
+      buttonText: "SHOP NOW",
+      dotsCount: 4,
+      isActive: true,
+    },
+  ],
+};
+
+async function readScreenToSpace() {
+  const page = await StorePage.findOne({ slug: SCREEN_TO_SPACE_SLUG }).select("content").lean();
+  if (!page?.content) return DEFAULT_SCREEN_TO_SPACE;
+  try {
+    const saved = JSON.parse(page.content);
+    if (!saved || typeof saved !== "object") return DEFAULT_SCREEN_TO_SPACE;
+    const items = Array.isArray(saved.items) && saved.items.length ? saved.items : DEFAULT_SCREEN_TO_SPACE.items;
+    return {
+      title: String(saved.title || DEFAULT_SCREEN_TO_SPACE.title).trim(),
+      subtitle: String(saved.subtitle || "").trim(),
+      isActive: saved.isActive !== false,
+      items: items.map((item, idx) => ({
+        id: String(item.id || `reel-${idx + 1}`),
+        overlayTag: String(item.overlayTag || "").trim(),
+        videoUrl: String(item.videoUrl || "").trim(),
+        imageUrl: String(item.imageUrl || "").trim(),
+        productTitle: String(item.productTitle || "").trim(),
+        productPrice: Number(item.productPrice) || 0,
+        productImage: String(item.productImage || "").trim(),
+        productSlug: String(item.productSlug || "").trim(),
+        buttonText: String(item.buttonText || "SHOP NOW").trim(),
+        dotsCount: Number(item.dotsCount) || 4,
+        isActive: item.isActive !== false,
+      })),
+    };
+  } catch (_error) {
+    return DEFAULT_SCREEN_TO_SPACE;
+  }
+}
+
+async function writeScreenToSpace(data) {
+  await StorePage.findOneAndUpdate(
+    { slug: SCREEN_TO_SPACE_SLUG },
+    {
+      $set: {
+        title: "From screen to space, seamlessly",
+        content: JSON.stringify(data),
+        isActive: true,
+      },
+      $setOnInsert: { slug: SCREEN_TO_SPACE_SLUG },
+    },
+    { upsert: true }
+  );
+}
+
+router.get("/admin/screen-to-space", async (_req, res) => {
+  try {
+    const data = await readScreenToSpace();
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error("Load screen to space error:", error);
+    res.status(500).json({ success: false, message: "Failed to load screen-to-space section" });
+  }
+});
+
+router.put("/admin/screen-to-space", async (req, res) => {
+  try {
+    const payload = req.body || {};
+    const title = String(payload.title || DEFAULT_SCREEN_TO_SPACE.title).trim();
+    const subtitle = String(payload.subtitle || "").trim();
+    const isActive = payload.isActive !== false;
+    const items = Array.isArray(payload.items) ? payload.items : [];
+
+    const cleanItems = items.map((item, idx) => ({
+      id: String(item.id || `reel-${Date.now()}-${idx}`),
+      overlayTag: String(item.overlayTag || "").trim(),
+      videoUrl: String(item.videoUrl || "").trim(),
+      imageUrl: String(item.imageUrl || "").trim(),
+      productTitle: String(item.productTitle || "").trim(),
+      productPrice: Number(item.productPrice) || 0,
+      productImage: String(item.productImage || "").trim(),
+      productSlug: String(item.productSlug || "").trim(),
+      buttonText: String(item.buttonText || "SHOP NOW").trim(),
+      dotsCount: Math.min(Math.max(Number(item.dotsCount) || 4, 1), 8),
+      isActive: item.isActive !== false,
+    }));
+
+    const nextData = {
+      title,
+      subtitle,
+      isActive,
+      items: cleanItems.length ? cleanItems : DEFAULT_SCREEN_TO_SPACE.items,
+    };
+
+    await writeScreenToSpace(nextData);
+    res.json({ success: true, data: nextData });
+  } catch (error) {
+    console.error("Update screen to space error:", error);
+    res.status(500).json({ success: false, message: "Failed to update screen-to-space section" });
+  }
+});
+
+router.post("/admin/screen-to-space/upload", (req, res) => {
+  uploadReelsMedia.fields([
+    { name: "video", maxCount: 1 },
+    { name: "image", maxCount: 1 },
+    { name: "productImage", maxCount: 1 },
+  ])(req, res, async (err) => {
+    if (err) {
+      return res.status(400).json({ success: false, message: err.message || "Upload failed" });
+    }
+    try {
+      const video = req.files?.video?.[0];
+      const image = req.files?.image?.[0];
+      const prodImg = req.files?.productImage?.[0];
+
+      res.json({
+        success: true,
+        data: {
+          videoUrl: video ? `/uploads/reels/${video.filename}` : undefined,
+          imageUrl: image ? `/uploads/reels/${image.filename}` : undefined,
+          productImage: prodImg ? `/uploads/reels/${prodImg.filename}` : undefined,
+        },
+      });
+    } catch (uploadError) {
+      console.error("Upload reel error:", uploadError);
+      res.status(500).json({ success: false, message: "Upload failed" });
+    }
+  });
+});
+
 
 router.get("/admin/faqs", async (_req, res) => {
   try {

@@ -101,12 +101,26 @@ const uploadFeaturedMedia = multer({
   limits: { fileSize: 40 * 1024 * 1024, files: 2 },
 });
 
+const reelsRoot = path.join(__dirname, "..", "uploads", "reels");
+fs.mkdirSync(reelsRoot, { recursive: true });
+
+const reelsStorage = mongoDiskStorage(reelsRoot);
+
+const uploadReelsMedia = multer({
+  storage: reelsStorage,
+  fileFilter: featuredFileFilter,
+  limits: { fileSize: 50 * 1024 * 1024, files: 5 },
+});
+
 module.exports = {
   uploadProductImages,
   uploadBannerImage,
   uploadTestimonialImages,
   uploadFeaturedMedia,
+  uploadReelsMedia,
   uploadRoot,
   bannerRoot,
   featuredRoot,
+  reelsRoot,
 };
+

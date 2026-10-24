@@ -1,11 +1,32 @@
+const path = require("path");
 const express = require("express");
+const multer = require("multer");
 const Product = require("../models/Product");
 const ProductAudit = require("../models/ProductAudit");
 const Remedy = require("../models/Remedy");
 const { uploadProductImages } = require("../middleware/upload");
 const { queryCatalog, queryFacets } = require("../lib/storeCatalog");
+const { buildProductExcelTemplate, parseProductsFromExcel } = require("../lib/productExcel");
 
 const router = express.Router();
+
+const excelUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 25 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    if (
+      [".xlsx", ".xls", ".csv"].includes(ext) ||
+      file.mimetype.includes("spreadsheet") ||
+      file.mimetype.includes("excel") ||
+      file.mimetype.includes("csv") ||
+      file.mimetype === "application/octet-stream"
+    ) {
+      return cb(null, true);
+    }
+    cb(new Error("Please upload a valid Excel (.xlsx, .xls) or CSV file"));
+  },
+});
 
 const INTENTIONS = ["Peace", "Wealth", "Health", "Protection", "Relationship", "Success", "Spirituality"];
 const CATEGORIES = [
@@ -198,6 +219,132 @@ router.get("/meta", async (_req, res) => {
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to load product meta" });
   }
+});
+
+router.get("/excel-template", (_req, res) => {
+  try {
+    const buffer = buildProductExcelTemplate();
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="Tathaastu_Product_Template.xlsx"'
+    );
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.send(buffer);
+  } catch (error) {
+    console.error("Excel template error:", error);
+    res.status(500).json({ success: false, message: "Failed to generate Excel template" });
+  }
+});
+
+router.post("/excel-import", (req, res) => {
+  excelUpload.single("file")(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "File upload failed" });
+    }
+    try {
+      if (!req.file || !req.file.buffer) {
+        return res.status(400).json({ success: false, message: "Please select an Excel or CSV file to upload" });
+      }
+
+      const { valid, errors, totalParsed } = parseProductsFromExcel(req.file.buffer);
+
+      if (!valid.length && errors.length) {
+        return res.status(400).json({
+          success: false,
+          message: "No valid products found in the file",
+          totalParsed,
+          importedCount: 0,
+          failedCount: errors.length,
+          errors,
+        });
+      }
+
+      const { actor, actorEmail } = actorFrom(req);
+      const createdProducts = [];
+      const importErrors = [...errors];
+
+      for (const item of valid) {
+        try {
+          const payload = item.payload;
+          let slug = payload.slug || slugify(payload.title);
+          const slugExists = await Product.findOne({ slug });
+          if (slugExists) {
+            slug = `${slug}-${Date.now().toString().slice(-4)}-${Math.floor(Math.random() * 900 + 100)}`;
+          }
+          payload.slug = slug;
+
+          if (payload.linkedRemedyName) {
+            try {
+              const remedy = await Remedy.findOne({
+                $or: [
+                  { name: new RegExp(`^${payload.linkedRemedyName}$`, "i") },
+                  { slug: slugify(payload.linkedRemedyName) },
+                  { name: new RegExp(payload.linkedRemedyName, "i") },
+                ],
+              }).select("_id name");
+              if (remedy) {
+                payload.linkedRemedyId = remedy._id;
+                payload.linkedRemedyName = remedy.name;
+              }
+            } catch (_remErr) {}
+          }
+
+          const product = await Product.create({
+            ...payload,
+            createdBy: actor,
+            updatedBy: actor,
+          });
+
+          try {
+            await writeAudit({
+              product,
+              action: payload.status === "listed" ? "publish" : "create",
+              actor,
+              actorEmail,
+              changes: { row: item.row, title: product.title, sku: product.sku },
+              note: `Imported from file (${req.file?.originalname || "Excel template"})`,
+            });
+          } catch (auditErr) {
+            console.warn("Product audit write warning:", auditErr.message);
+          }
+
+          createdProducts.push({
+            _id: product._id,
+            title: product.title,
+            sku: product.sku,
+            category: product.category,
+            salePrice: product.salePrice,
+            status: product.status,
+          });
+        } catch (rowErr) {
+          importErrors.push({
+            row: item.row,
+            title: item.payload?.title || "Unknown",
+            error: rowErr.message || "Database insert error",
+          });
+        }
+      }
+
+      res.status(200).json({
+        success: true,
+        message: `Successfully imported ${createdProducts.length} of ${totalParsed} products`,
+        totalParsed,
+        importedCount: createdProducts.length,
+        failedCount: importErrors.length,
+        importedProducts: createdProducts,
+        errors: importErrors,
+      });
+    } catch (error) {
+      console.error("Excel import error:", error);
+      res.status(500).json({
+        success: false,
+        message: error.message || "Failed to process Excel file",
+      });
+    }
+  });
 });
 
 router.get("/stats", async (_req, res) => {

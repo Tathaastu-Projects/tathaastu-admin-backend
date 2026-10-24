@@ -16,6 +16,8 @@ const productAuditSchema = new mongoose.Schema(
         "draft",
         "bulk_list",
         "bulk_unlist",
+        "bulk_import",
+        "bulk_import_listed",
         "price_change",
         "stock_change",
         "image_upload",

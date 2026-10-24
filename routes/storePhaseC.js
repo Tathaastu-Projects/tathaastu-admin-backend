@@ -785,29 +785,36 @@ function removeBannerFile(imageUrl) {
   deleteStoredFile(path.basename(String(imageUrl))).catch(() => {});
 }
 
-function readBannerFields(body, file) {
+const CATEGORY_BANNER_KEY = "category-banner";
+
+function readBannerFields(body, file, defaultKey = HOME_SLIDER_KEY) {
   const title = String(body?.title || "").trim();
   const titleLine2 = String(body?.titleLine2 || "").trim();
   const subtitle = String(body?.subtitle || "").trim();
   const category = String(body?.category || "").trim();
   const cat = categoryById(category);
-  const ctaLabel = String(body?.ctaLabel || "").trim() || (cat ? `Explore ${cat.label}` : "Explore");
+  const ctaLabel = body?.ctaLabel !== undefined ? String(body.ctaLabel).trim() : "";
   const sortOrder = Number(body?.sortOrder);
   const isActive = body?.isActive === undefined || body?.isActive === ""
     ? true
     : body.isActive === true || body.isActive === "true";
+  const rawKey = body?.key ? String(body.key).trim() : defaultKey;
   const payload = {
-    key: HOME_SLIDER_KEY,
+    key: rawKey || defaultKey,
     title,
     titleLine2,
     subtitle,
-    category: cat ? cat.id : "",
+    category: cat ? cat.id : (category || ""),
     ctaLabel,
-    ctaHref: cat ? cat.href : "/shop",
+    ctaHref: cat ? cat.href : (body?.ctaHref || (category ? `/shop/${category}` : "/shop")),
     sortOrder: Number.isFinite(sortOrder) ? sortOrder : 0,
     isActive,
   };
-  if (file) payload.imageUrl = `/uploads/banners/${file.filename}`;
+  if (file) {
+    payload.imageUrl = `/uploads/banners/${file.filename}`;
+  } else if (body?.imageUrl !== undefined) {
+    payload.imageUrl = String(body.imageUrl).trim();
+  }
   return payload;
 }
 
@@ -855,6 +862,27 @@ router.put("/admin/logo", (req, res) => {
       res.status(500).json({ success: false, message: "Failed to update logo" });
     }
   });
+});
+
+router.delete("/admin/logo", async (_req, res) => {
+  try {
+    const existing = await StorePage.findOne({ slug: "site-logo" }).select("content").lean();
+    if (existing?.content && existing.content !== "/tathaastu_logo.png") {
+      removeBannerFile(existing.content);
+    }
+    await StorePage.findOneAndUpdate(
+      { slug: "site-logo" },
+      {
+        $set: { title: "Site logo", content: "/tathaastu_logo.png", isActive: true },
+        $setOnInsert: { slug: "site-logo" },
+      },
+      { upsert: true, new: true }
+    );
+    res.json({ success: true, data: { imageUrl: "/tathaastu_logo.png" }, message: "Logo reset to default" });
+  } catch (error) {
+    console.error("Delete logo error:", error);
+    res.status(500).json({ success: false, message: "Failed to reset logo" });
+  }
 });
 
 async function readCategoryTiles() {
@@ -937,25 +965,55 @@ router.put("/admin/category-tiles/:id", (req, res) => {
   });
 });
 
+router.delete("/admin/category-tiles/:id/image", async (req, res) => {
+  try {
+    const base = tileById(req.params.id);
+    if (!base) {
+      return res.status(404).json({ success: false, message: "Category frame not found" });
+    }
+    const tiles = await readCategoryTiles();
+    const current = tiles.find((tile) => tile.id === base.id);
+    if (current?.image && current.image !== base.image) {
+      removeBannerFile(current.image);
+    }
+    const next = tiles.map((tile) => (tile.id === base.id ? { ...tile, image: base.image } : tile));
+    await writeCategoryTiles(next);
+    res.json({ success: true, data: next.find((tile) => tile.id === base.id), message: "Category photo reset to default" });
+  } catch (error) {
+    console.error("Delete category tile image error:", error);
+    res.status(500).json({ success: false, message: "Failed to reset category photo" });
+  }
+});
+
 async function aboutMedia(current, body, file) {
   let image = String(current?.image || "");
   const pasted = String(body?.imageUrl || "").trim();
-  if (file) {
+  const removeImage = String(body?.removeImage || "") === "true" || body?.removeImage === true;
+  const removeVideo = String(body?.removeVideo || "") === "true" || body?.removeVideo === true;
+
+  if (removeImage) {
+    if (image) removeBannerFile(image);
+    image = "";
+  } else if (file) {
     const nextImage = `/uploads/banners/${file.filename}`;
     if (image !== nextImage) removeBannerFile(image);
     image = nextImage;
   } else if (pasted) {
     if (image !== pasted) removeBannerFile(image);
     image = pasted;
+  } else if (body?.imageUrl !== undefined && pasted === "" && !file) {
+    if (image) removeBannerFile(image);
+    image = "";
   } else if (/^https?:\/\//i.test(image)) {
     image = String(current?.fallbackImage || "");
   }
 
-  const videoUrl = String(body?.videoUrl || "").trim();
+  let videoUrl = String(body?.videoUrl || "").trim();
   let playbackUrl = String(current?.playbackUrl || "");
-  if (!videoUrl) {
+  if (removeVideo || !videoUrl) {
     if (playbackUrl) removeTestimonialVideo(playbackUrl);
     playbackUrl = "";
+    videoUrl = "";
   } else if (videoUrl !== String(current?.videoUrl || "") || !playbackUrl) {
     if (playbackUrl) removeTestimonialVideo(playbackUrl);
     playbackUrl = await prepareTestimonialVideo(videoUrl);
@@ -1034,6 +1092,34 @@ router.get("/admin/about", async (_req, res) => {
   } catch (error) {
     console.error("Load about section error:", error);
     res.status(500).json({ success: false, message: "Failed to load about section" });
+  }
+});
+
+router.delete("/admin/about/image", async (_req, res) => {
+  try {
+    const section = await readAboutSection();
+    if (section.image) removeBannerFile(section.image);
+    section.image = "";
+    section.imageUrl = "";
+    await writeAboutSection(section);
+    res.json({ success: true, data: section, message: "Photo removed successfully" });
+  } catch (error) {
+    console.error("Delete about image error:", error);
+    res.status(500).json({ success: false, message: "Failed to remove photo" });
+  }
+});
+
+router.delete("/admin/about/video", async (_req, res) => {
+  try {
+    const section = await readAboutSection();
+    if (section.playbackUrl) removeTestimonialVideo(section.playbackUrl);
+    section.videoUrl = "";
+    section.playbackUrl = "";
+    await writeAboutSection(section);
+    res.json({ success: true, data: section, message: "Video removed successfully" });
+  } catch (error) {
+    console.error("Delete about video error:", error);
+    res.status(500).json({ success: false, message: "Failed to remove video" });
   }
 });
 
@@ -1389,6 +1475,25 @@ router.put("/admin/testimonials", (req, res) => {
   });
 });
 
+router.delete("/admin/testimonials/:index", async (req, res) => {
+  try {
+    const index = parseInt(req.params.index, 10);
+    const current = await readTestimonials();
+    if (isNaN(index) || index < 0 || index >= current.length) {
+      return res.status(400).json({ success: false, message: "Invalid testimonial index" });
+    }
+    const target = current[index];
+    if (target?.imageUrl) removeBannerFile(target.imageUrl);
+    if (target?.playbackUrl) removeTestimonialVideo(target.playbackUrl);
+    const next = current.filter((_, i) => i !== index);
+    await writeTestimonials(next);
+    res.json({ success: true, data: next, message: "Testimonial removed successfully" });
+  } catch (error) {
+    console.error("Delete testimonial error:", error);
+    res.status(500).json({ success: false, message: "Failed to delete testimonial" });
+  }
+});
+
 const FEATURED_SLUG = "home-featured-finds";
 
 const DEFAULT_FEATURED = {
@@ -1489,11 +1594,23 @@ router.put("/admin/featured-finds", (req, res) => {
         const next = `/uploads/featured/${video.filename}`;
         if (videoUrl && videoUrl !== next) removeFeaturedFile(videoUrl);
         videoUrl = next;
+      } else if (req.body?.videoUrl !== undefined) {
+        const customVideo = String(req.body.videoUrl).trim();
+        if (videoUrl && videoUrl !== customVideo && videoUrl.startsWith("/uploads/featured/")) {
+          removeFeaturedFile(videoUrl);
+        }
+        videoUrl = customVideo;
       }
       if (image) {
         const next = `/uploads/featured/${image.filename}`;
         if (imageUrl && imageUrl !== next) removeFeaturedFile(imageUrl);
         imageUrl = next;
+      } else if (req.body?.imageUrl !== undefined) {
+        const customImage = String(req.body.imageUrl).trim();
+        if (imageUrl && imageUrl !== customImage && imageUrl.startsWith("/uploads/featured/")) {
+          removeFeaturedFile(imageUrl);
+        }
+        imageUrl = customImage;
       }
       const section = {
         eyebrow: String(req.body?.eyebrow || DEFAULT_FEATURED.eyebrow).trim(),
@@ -1512,6 +1629,32 @@ router.put("/admin/featured-finds", (req, res) => {
       res.status(500).json({ success: false, message: "Failed to update Karungali section" });
     }
   });
+});
+
+router.delete("/admin/featured-finds/video", async (_req, res) => {
+  try {
+    const current = await readFeaturedFinds();
+    if (current.videoUrl) removeFeaturedFile(current.videoUrl);
+    current.videoUrl = "";
+    await writeFeaturedFinds(current);
+    res.json({ success: true, data: current, message: "Video removed successfully" });
+  } catch (error) {
+    console.error("Delete featured video error:", error);
+    res.status(500).json({ success: false, message: "Failed to remove video" });
+  }
+});
+
+router.delete("/admin/featured-finds/image", async (_req, res) => {
+  try {
+    const current = await readFeaturedFinds();
+    if (current.imageUrl) removeFeaturedFile(current.imageUrl);
+    current.imageUrl = "";
+    await writeFeaturedFinds(current);
+    res.json({ success: true, data: current, message: "Photo removed successfully" });
+  } catch (error) {
+    console.error("Delete featured image error:", error);
+    res.status(500).json({ success: false, message: "Failed to remove photo" });
+  }
 });
 
 /* ------------------------ Screen to Space (Shoppable Reels) ------------------------ */
@@ -1725,15 +1868,43 @@ router.get("/admin/faqs", async (_req, res) => {
 
 router.put("/admin/faqs", async (req, res) => {
   try {
-    const faqs = normalizeFaqs(req.body?.faqs);
-    if (!faqs.length) {
-      return res.status(400).json({ success: false, message: "Add at least one question and answer" });
+    const raw = req.body?.faqs;
+    if (Array.isArray(raw) && raw.length === 0) {
+      await writeHomeFaqs([]);
+      return res.json({ success: true, data: [] });
     }
+    const faqs = normalizeFaqs(raw);
     await writeHomeFaqs(faqs);
     res.json({ success: true, data: faqs });
   } catch (error) {
     console.error("Update home FAQs error:", error);
     res.status(500).json({ success: false, message: "Failed to update FAQs" });
+  }
+});
+
+router.delete("/admin/faqs/:index", async (req, res) => {
+  try {
+    const index = parseInt(req.params.index, 10);
+    const current = await readHomeFaqs();
+    if (isNaN(index) || index < 0 || index >= current.length) {
+      return res.status(400).json({ success: false, message: "Invalid FAQ index" });
+    }
+    const next = current.filter((_, i) => i !== index);
+    await writeHomeFaqs(next);
+    res.json({ success: true, data: next, message: "FAQ removed successfully" });
+  } catch (error) {
+    console.error("Delete FAQ error:", error);
+    res.status(500).json({ success: false, message: "Failed to delete FAQ" });
+  }
+});
+
+router.delete("/admin/faqs", async (_req, res) => {
+  try {
+    await writeHomeFaqs([]);
+    res.json({ success: true, data: [], message: "All FAQs cleared" });
+  } catch (error) {
+    console.error("Delete all FAQs error:", error);
+    res.status(500).json({ success: false, message: "Failed to clear FAQs" });
   }
 });
 
@@ -1778,24 +1949,71 @@ router.put("/admin/about/features/:id", (req, res) => {
   });
 });
 
+router.delete("/admin/about/features/:id/image", async (req, res) => {
+  try {
+    const base = aboutFeatureById(req.params.id);
+    if (!base) {
+      return res.status(404).json({ success: false, message: "Point not found" });
+    }
+    const section = await readAboutSection();
+    const current = section.features.find((item) => item.id === base.id);
+    if (current?.image) removeBannerFile(current.image);
+    section.features = section.features.map((item) =>
+      item.id === base.id
+        ? {
+            ...item,
+            image: "",
+            imageUrl: "",
+          }
+        : item
+    );
+    await writeAboutSection(section);
+    const updated = section.features.find((item) => item.id === base.id);
+    res.json({ success: true, data: updated, message: "Photo removed successfully" });
+  } catch (error) {
+    console.error("Delete feature image error:", error);
+    res.status(500).json({ success: false, message: "Failed to remove photo" });
+  }
+});
+
+router.delete("/admin/about/features/:id/video", async (req, res) => {
+  try {
+    const base = aboutFeatureById(req.params.id);
+    if (!base) {
+      return res.status(404).json({ success: false, message: "Point not found" });
+    }
+    const section = await readAboutSection();
+    const current = section.features.find((item) => item.id === base.id);
+    if (current?.playbackUrl) removeTestimonialVideo(current.playbackUrl);
+    section.features = section.features.map((item) =>
+      item.id === base.id
+        ? {
+            ...item,
+            videoUrl: "",
+            playbackUrl: "",
+          }
+        : item
+    );
+    await writeAboutSection(section);
+    const updated = section.features.find((item) => item.id === base.id);
+    res.json({ success: true, data: updated, message: "Video removed successfully" });
+  } catch (error) {
+    console.error("Delete feature video error:", error);
+    res.status(500).json({ success: false, message: "Failed to remove video" });
+  }
+});
+
 router.post("/admin/home-banners", (req, res) => {
   uploadBannerImage.single("image")(req, res, async (uploadError) => {
     if (uploadError) {
       return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
     }
     try {
-      const payload = readBannerFields(req.body, req.file);
-      if (!payload.title) {
-        removeBannerFile(payload.imageUrl);
-        return res.status(400).json({ success: false, message: "Headline is required" });
+      const rawUrl = String(req.body?.imageUrl || "").trim();
+      if (!req.file && !rawUrl) {
+        return res.status(400).json({ success: false, message: "Banner image file or live URL is required" });
       }
-      if (!payload.category) {
-        removeBannerFile(payload.imageUrl);
-        return res.status(400).json({ success: false, message: "Choose a category for the button" });
-      }
-      if (!req.file) {
-        return res.status(400).json({ success: false, message: "Banner image is required" });
-      }
+      const payload = readBannerFields(req.body, req.file, HOME_SLIDER_KEY);
       const last = await StoreBanner.findOne({ key: HOME_SLIDER_KEY }).sort({ sortOrder: -1 }).select("sortOrder").lean();
       if (!payload.sortOrder) payload.sortOrder = (last?.sortOrder || 0) + 1;
       const banner = await StoreBanner.create(payload);
@@ -1818,15 +2036,7 @@ router.put("/admin/home-banners/:id", (req, res) => {
         if (req.file) removeBannerFile(`/uploads/banners/${req.file.filename}`);
         return res.status(404).json({ success: false, message: "Banner not found" });
       }
-      const payload = readBannerFields(req.body, req.file);
-      if (!payload.title) {
-        removeBannerFile(payload.imageUrl);
-        return res.status(400).json({ success: false, message: "Headline is required" });
-      }
-      if (!payload.category) {
-        removeBannerFile(payload.imageUrl);
-        return res.status(400).json({ success: false, message: "Choose a category for the button" });
-      }
+      const payload = readBannerFields(req.body, req.file, HOME_SLIDER_KEY);
       if (!payload.sortOrder) payload.sortOrder = existing.sortOrder || 0;
       if (req.file && existing.imageUrl && existing.imageUrl !== payload.imageUrl) {
         removeBannerFile(existing.imageUrl);
@@ -1849,6 +2059,90 @@ router.delete("/admin/home-banners/:id", async (req, res) => {
     res.json({ success: true, message: "Banner deleted" });
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to delete banner" });
+  }
+});
+
+/* ------------------------ Category Banners CRUD ------------------------ */
+router.get("/admin/category-banners", async (req, res) => {
+  try {
+    const filter = { key: CATEGORY_BANNER_KEY };
+    if (req.query.category) {
+      filter.category = String(req.query.category).trim();
+    }
+    const data = await StoreBanner.find(filter).sort({ sortOrder: 1, createdAt: 1 });
+    res.json({ success: true, data, categories: HERO_CATEGORIES });
+  } catch (error) {
+    console.error("List category banners error:", error);
+    res.status(500).json({ success: false, message: "Failed to load category banners" });
+  }
+});
+
+router.post("/admin/category-banners", (req, res) => {
+  uploadBannerImage.single("image")(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      const rawUrl = String(req.body?.imageUrl || "").trim();
+      if (!req.file && !rawUrl) {
+        return res.status(400).json({ success: false, message: "Banner image file or live URL is required" });
+      }
+      const category = String(req.body?.category || "").trim();
+      if (!category) {
+        return res.status(400).json({ success: false, message: "Category is required" });
+      }
+      const payload = readBannerFields(req.body, req.file, CATEGORY_BANNER_KEY);
+      payload.key = CATEGORY_BANNER_KEY;
+      payload.category = category;
+      if (!payload.ctaHref) payload.ctaHref = `/shop/${category}`;
+
+      const last = await StoreBanner.findOne({ key: CATEGORY_BANNER_KEY, category }).sort({ sortOrder: -1 }).select("sortOrder").lean();
+      if (!payload.sortOrder) payload.sortOrder = (last?.sortOrder || 0) + 1;
+
+      const banner = await StoreBanner.create(payload);
+      res.status(201).json({ success: true, data: banner });
+    } catch (error) {
+      console.error("Create category banner error:", error);
+      res.status(500).json({ success: false, message: "Failed to create category banner" });
+    }
+  });
+});
+
+router.put("/admin/category-banners/:id", (req, res) => {
+  uploadBannerImage.single("image")(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      const existing = await StoreBanner.findOne({ _id: req.params.id, key: CATEGORY_BANNER_KEY });
+      if (!existing) {
+        if (req.file) removeBannerFile(`/uploads/banners/${req.file.filename}`);
+        return res.status(404).json({ success: false, message: "Category banner not found" });
+      }
+      const payload = readBannerFields(req.body, req.file, CATEGORY_BANNER_KEY);
+      payload.key = CATEGORY_BANNER_KEY;
+      if (!payload.sortOrder) payload.sortOrder = existing.sortOrder || 0;
+      if (req.file && existing.imageUrl && existing.imageUrl !== payload.imageUrl) {
+        removeBannerFile(existing.imageUrl);
+      }
+      Object.assign(existing, payload);
+      await existing.save();
+      res.json({ success: true, data: existing });
+    } catch (error) {
+      console.error("Update category banner error:", error);
+      res.status(500).json({ success: false, message: "Failed to update category banner" });
+    }
+  });
+});
+
+router.delete("/admin/category-banners/:id", async (req, res) => {
+  try {
+    const banner = await StoreBanner.findOneAndDelete({ _id: req.params.id, key: CATEGORY_BANNER_KEY });
+    if (!banner) return res.status(404).json({ success: false, message: "Category banner not found" });
+    removeBannerFile(banner.imageUrl);
+    res.json({ success: true, message: "Category banner deleted" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to delete category banner" });
   }
 });
 
@@ -1937,6 +2231,49 @@ router.put("/admin/home-blogs", (req, res) => {
   });
 });
 
+router.delete("/admin/home-blogs/:id/image", async (req, res) => {
+  try {
+    const post = await StoreBlogPost.findById(req.params.id);
+    if (!post) return res.status(404).json({ success: false, message: "Blog not found" });
+    if (post.coverImage) removeBannerFile(post.coverImage);
+    post.coverImage = "";
+    await post.save();
+    res.json({ success: true, data: post, message: "Blog cover image removed" });
+  } catch (error) {
+    console.error("Delete blog cover image error:", error);
+    res.status(500).json({ success: false, message: "Failed to remove blog cover image" });
+  }
+});
+
+router.delete("/admin/home-blogs/:id/video", async (req, res) => {
+  try {
+    const post = await StoreBlogPost.findById(req.params.id);
+    if (!post) return res.status(404).json({ success: false, message: "Blog not found" });
+    if (post.playbackUrl) removeTestimonialVideo(post.playbackUrl);
+    post.videoUrl = "";
+    post.playbackUrl = "";
+    await post.save();
+    res.json({ success: true, data: post, message: "Blog video removed" });
+  } catch (error) {
+    console.error("Delete blog video error:", error);
+    res.status(500).json({ success: false, message: "Failed to remove blog video" });
+  }
+});
+
+router.delete("/admin/home-blogs/:id", async (req, res) => {
+  try {
+    const post = await StoreBlogPost.findById(req.params.id);
+    if (!post) return res.status(404).json({ success: false, message: "Blog not found" });
+    if (post.coverImage) removeBannerFile(post.coverImage);
+    if (post.playbackUrl) removeTestimonialVideo(post.playbackUrl);
+    await StoreBlogPost.findByIdAndDelete(req.params.id);
+    res.json({ success: true, message: "Blog post deleted" });
+  } catch (error) {
+    console.error("Delete blog post error:", error);
+    res.status(500).json({ success: false, message: "Failed to delete blog post" });
+  }
+});
+
 router.post("/admin/blogs", async (req, res) => {
   try {
     const title = String(req.body?.title || "").trim();
@@ -1961,6 +2298,19 @@ router.put("/admin/blogs/:id", async (req, res) => {
     res.json({ success: true, data: post });
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to update blog" });
+  }
+});
+
+router.delete("/admin/blogs/:id", async (req, res) => {
+  try {
+    const post = await StoreBlogPost.findById(req.params.id);
+    if (!post) return res.status(404).json({ success: false, message: "Blog not found" });
+    if (post.coverImage) removeBannerFile(post.coverImage);
+    if (post.playbackUrl) removeTestimonialVideo(post.playbackUrl);
+    await StoreBlogPost.findByIdAndDelete(req.params.id);
+    res.json({ success: true, message: "Blog post deleted" });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to delete blog post" });
   }
 });
 

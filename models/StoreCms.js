@@ -3,12 +3,12 @@ const mongoose = require("mongoose");
 const storeBannerSchema = new mongoose.Schema(
   {
     key: { type: String, default: "home-hero", index: true },
-    title: { type: String, required: true },
+    title: { type: String, default: "" },
     titleLine2: { type: String, default: "" },
     subtitle: { type: String, default: "" },
     imageUrl: { type: String, default: "" },
     category: { type: String, default: "" },
-    ctaLabel: { type: String, default: "Shop Now" },
+    ctaLabel: { type: String, default: "" },
     ctaHref: { type: String, default: "/shop" },
     sortOrder: { type: Number, default: 0 },
     isActive: { type: Boolean, default: true, index: true },

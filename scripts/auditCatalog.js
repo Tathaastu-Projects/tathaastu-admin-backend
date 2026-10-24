@@ -1,11 +1,11 @@
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
-const mongoose = require("mongoose");
+const { ensureStorageLayout } = require("../lib/fileDb");
+ensureStorageLayout();
 const Product = require("../models/Product");
 
 async function main() {
-  await mongoose.connect(process.env.MONGODB_URI || "mongodb://localhost:27017/tathasstu-admin");
-  const total = await Product.countDocuments({});
+    const total = await Product.countDocuments({});
   const listed = await Product.countDocuments({ status: "listed" });
   const byCat = await Product.aggregate([
     { $match: { status: "listed" } },
@@ -39,8 +39,7 @@ async function main() {
       2
     )
   );
-  await mongoose.disconnect();
-}
+  }
 
 main().catch((e) => {
   console.error(e);

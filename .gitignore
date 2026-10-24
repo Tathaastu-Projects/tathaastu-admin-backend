@@ -33,6 +33,10 @@ uploads/
 generated/
 *.local.pptx
 
+# Local file database + media (created automatically on server start — do not commit/deploy via git)
+storage/
+scripts/_patchRemoveMongoose.js
+
 # OS / editor
 .DS_Store
 Thumbs.db

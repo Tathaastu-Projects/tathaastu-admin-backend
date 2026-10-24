@@ -1,6 +1,15 @@
 # tathaastu-admin-backend
 
-Single Express + MongoDB API for **admin portal** and **storefront**.
+Single Express API for **admin portal** and **storefront**, using **local file storage** (no MongoDB).
+
+## Storage layout
+
+```
+storage/
+  data/                 # JSON “tables” (products, customers, orders, CMS…)
+  images/               # Mirrored media copies
+uploads/                # Primary media served at /uploads/*
+```
 
 ## Clients
 
@@ -17,16 +26,17 @@ Single Express + MongoDB API for **admin portal** and **storefront**.
 | `/api/products` | Admin CRUD (+ `/public` for store fallback) |
 | `/api/queries`, `/api/remedies`, `/api/users`, `/api/courses`, `/api/orders`, `/api/events`, `/api/notifications`, `/api/analytics` | Admin |
 | `/api/store` | Store public + nested `/admin/*` (orders, CMS, coupons…) |
-| `/api/store/admin/home-banners` | Homepage slider: list, upload, edit text and button category, delete |
 | `/api/health` | Health |
-| `/uploads` | Static uploads |
+| `/uploads` | Static uploads (images/videos) |
 
 ## Env essentials
 
-`MONGODB_URI`, `PORT`, `JWT_SECRET`, `NODE_ENV`  
+`PORT`, `JWT_SECRET`, `NODE_ENV`  
 Optional: `RAZORPAY_*`, `STORE_*`, `MS_GRAPH_*`, `ADMIN_NOTIFICATION_EMAILS`
 
 ## Seed
 
 `npm run seed` — remedies + sample products + collections/CMS/coupons  
 Full import: `npm run import:gemsmantra`
+
+Upload product and homepage media via the **admin panel** — files are stored on disk under `uploads/` and mirrored to `storage/images/`.

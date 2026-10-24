@@ -7,6 +7,7 @@ const Remedy = require("../models/Remedy");
 const { uploadProductImages } = require("../middleware/upload");
 const { queryCatalog, queryFacets } = require("../lib/storeCatalog");
 const { buildProductExcelTemplate, parseProductsFromExcel } = require("../lib/productExcel");
+const { deleteUploadByUrl } = require("../lib/storedFiles");
 
 const router = express.Router();
 
@@ -596,6 +597,37 @@ router.post("/bulk-status", async (req, res) => {
   }
 });
 
+/** Stage product images (multi-select) — returns /uploads/products/... URLs for the form */
+router.post("/upload-images", (req, res) => {
+  uploadProductImages.array("images", 12)(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({
+        success: false,
+        message: uploadError.message || "Image upload failed",
+      });
+    }
+    try {
+      const files = req.files || [];
+      if (!files.length) {
+        return res.status(400).json({ success: false, message: "Select one or more images" });
+      }
+      const images = files.map((file, index) => ({
+        url: `/uploads/products/${file.filename}`,
+        alt: String(req.body?.alt || "").trim() || "Product image",
+        isPrimary: index === 0,
+      }));
+      res.json({
+        success: true,
+        data: images,
+        message: `${images.length} image${images.length === 1 ? "" : "s"} uploaded`,
+      });
+    } catch (error) {
+      console.error("Product image stage upload error:", error);
+      res.status(500).json({ success: false, message: error.message || "Image upload failed" });
+    }
+  });
+});
+
 router.get("/:id", async (req, res) => {
   try {
     const product = await Product.findById(req.params.id);
@@ -691,7 +723,7 @@ router.patch("/:id/status", async (req, res) => {
   }
 });
 
-router.post("/:id/images", uploadProductImages.array("images", 8), async (req, res) => {
+router.post("/:id/images", uploadProductImages.array("images", 12), async (req, res) => {
   try {
     const product = await Product.findById(req.params.id);
     if (!product) return res.status(404).json({ success: false, message: "Product not found" });
@@ -743,9 +775,14 @@ router.delete("/:id", async (req, res) => {
       changes: { title: product.title, sku: product.sku },
       note: "Product deleted",
     });
+    // Remove product image files from disk + storage mirror
+    for (const img of product.images || []) {
+      if (img?.url) await deleteUploadByUrl(img.url);
+    }
     await product.deleteOne();
     res.json({ success: true, message: "Product deleted" });
   } catch (error) {
+    console.error("Delete product error:", error);
     res.status(500).json({ success: false, message: "Failed to delete product" });
   }
 });

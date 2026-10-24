@@ -1,15 +1,20 @@
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
-const mongoose = require("mongoose");
+const { ensureStorageLayout } = require("../lib/fileDb");
 const Remedy = require("../models/Remedy");
 const { buildAllRemedies } = require("../data/buildRemedies");
 
 async function seed() {
-  const uri = process.env.MONGODB_URI || "mongodb://localhost:27017/tathasstu-admin";
-  await mongoose.connect(uri);
-  console.log("Connected to MongoDB");
+  ensureStorageLayout();
+  console.log("Using local file storage");
 
-  const remedies = buildAllRemedies();
+  let remedies = [];
+  try {
+    remedies = buildAllRemedies();
+  } catch (err) {
+    console.warn("⚠️  Remedy PDF sources missing — writing empty remedies.json:", err.message);
+    remedies = [];
+  }
   console.log("Built remedies:", remedies.length);
   const byCategory = remedies.reduce((acc, item) => {
     acc[item.category] = (acc[item.category] || 0) + 1;
@@ -20,14 +25,10 @@ async function seed() {
   await Remedy.deleteMany({});
   await Remedy.insertMany(remedies);
 
-  console.log("✅ Seeded", remedies.length, "remedies into MongoDB");
-  await mongoose.disconnect();
+  console.log("✅ Seeded", remedies.length, "remedies into storage/data/remedies.json");
 }
 
-seed().catch(async (err) => {
+seed().catch((err) => {
   console.error("Seed failed:", err);
-  try {
-    await mongoose.disconnect();
-  } catch (_) {}
   process.exit(1);
 });

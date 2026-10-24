@@ -1,6 +1,6 @@
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
-const mongoose = require("mongoose");
+const { ensureStorageLayout } = require("../lib/fileDb");
 const Product = require("../models/Product");
 const ProductAudit = require("../models/ProductAudit");
 const Remedy = require("../models/Remedy");
@@ -13,7 +13,7 @@ function slugify(value) {
 }
 
 async function seed() {
-  await mongoose.connect(process.env.MONGODB_URI || "mongodb://localhost:27017/tathasstu-admin");
+  ensureStorageLayout();
 
   const fiveMukhi = await Remedy.findOne({ slug: "rudraksha-5-mukhi" }).lean();
   const amethyst = await Remedy.findOne({ name: /amethyst/i }).lean();
@@ -58,7 +58,7 @@ async function seed() {
       ],
       images: [
         {
-          url: "https://images.unsplash.com/photo-1611652022419-a9419f74343d?w=600",
+          url: "",
           alt: "5 Mukhi Rudraksha",
           isPrimary: true,
         },
@@ -91,7 +91,7 @@ async function seed() {
       ],
       images: [
         {
-          url: "https://images.unsplash.com/photo-1596753365494-1c0c0f8b8b8b?w=600",
+          url: "",
           alt: "Amethyst crystal",
           isPrimary: true,
         },
@@ -117,7 +117,7 @@ async function seed() {
       variants: [],
       images: [
         {
-          url: "https://images.unsplash.com/photo-1515562141207-7a88fb7ce338?w=600",
+          url: "",
           alt: "Citrine bracelet",
           isPrimary: true,
         },
@@ -143,7 +143,7 @@ async function seed() {
       attributes: { stone: "Black Tourmaline", color: "Black", shape: "Raw", gender: "Unisex" },
       images: [
         {
-          url: "https://images.unsplash.com/photo-1605100804763-247f67b3557e?w=600",
+          url: "",
           alt: "Black tourmaline",
           isPrimary: true,
         },
@@ -166,7 +166,7 @@ async function seed() {
       attributes: { occasion: "Home Temple", shape: "Framed", gender: "Unisex" },
       images: [
         {
-          url: "https://images.unsplash.com/photo-1578662996442-48f60103fc96?w=600",
+          url: "",
           alt: "Shree Yantra",
           isPrimary: true,
         },
@@ -197,14 +197,10 @@ async function seed() {
     }))
   );
 
-  console.log(`✅ Seeded ${created.length} products`);
-  await mongoose.disconnect();
+  console.log(`✅ Seeded ${created.length} products into storage/data/products.json`);
 }
 
-seed().catch(async (err) => {
+seed().catch((err) => {
   console.error(err);
-  try {
-    await mongoose.disconnect();
-  } catch (_) {}
   process.exit(1);
 });

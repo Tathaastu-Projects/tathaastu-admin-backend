@@ -37,7 +37,8 @@ async function optionalStoreAuth(req, _res, next) {
       return next();
     }
     const customer = await StoreCustomer.findById(payload.sub).select("-passwordHash");
-    req.storeCustomer = customer && customer.isActive ? customer : null;
+    // Missing isActive (legacy rows) counts as active; only explicit false suspends
+    req.storeCustomer = customer && customer.isActive !== false ? customer : null;
     return next();
   } catch (_err) {
     req.storeCustomer = null;

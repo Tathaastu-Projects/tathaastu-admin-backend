@@ -8,7 +8,8 @@
  */
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
-const mongoose = require("mongoose");
+const { ensureStorageLayout } = require("../lib/fileDb");
+ensureStorageLayout();
 const Product = require("../models/Product");
 
 const CATEGORIES = new Set([
@@ -193,8 +194,7 @@ async function fetchPage(page, limit) {
 
 async function main() {
   const { pages, limit } = parseArgs(process.argv.slice(2));
-  await mongoose.connect(process.env.MONGODB_URI || "mongodb://localhost:27017/tathasstu-admin");
-  console.log(`Importing up to ${pages} page(s) × ${limit} from GemsMantra...`);
+    console.log(`Importing up to ${pages} page(s) × ${limit} from GemsMantra...`);
 
   let imported = 0;
   let updated = 0;
@@ -239,14 +239,12 @@ async function main() {
   }
 
   console.log(JSON.stringify({ imported, updated, skipped }, null, 2));
-  await mongoose.disconnect();
-}
+  }
 
 main().catch(async (err) => {
   console.error(err);
   try {
-    await mongoose.disconnect();
-  } catch (_) {
+      } catch (_) {
     /* ignore */
   }
   process.exit(1);

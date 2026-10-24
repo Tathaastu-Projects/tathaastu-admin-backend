@@ -2,21 +2,29 @@ const express = require("express");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
-const mongoose = require("mongoose");
+const { Types } = require("../lib/fileDb");
 const StoreCustomer = require("../models/StoreCustomer");
 const StoreReview = require("../models/StoreReview");
 const StoreCoupon = require("../models/StoreCoupon");
 const StoreWishlist = require("../models/StoreWishlist");
+const StoreCart = require("../models/StoreCart");
 const StoreOrder = require("../models/StoreOrder");
 const Product = require("../models/Product");
 const { StoreBanner, StoreBlogPost, StorePage } = require("../models/StoreCms");
 const { findValidCoupon, computeCouponDiscount } = require("../lib/storeCoupons");
 const { signCustomerToken, optionalStoreAuth, requireStoreAuth } = require("../middleware/storeAuth");
 const { restoreStock } = require("../lib/storeStock");
-const { uploadBannerImage, uploadFeaturedMedia, uploadTestimonialImages, uploadReelsMedia } = require("../middleware/upload");
+const {
+  uploadBannerImage,
+  uploadFeaturedMedia,
+  uploadTestimonialImages,
+  uploadReelsMedia,
+  uploadAboutMedia,
+  uploadBlogMedia,
+} = require("../middleware/upload");
 const { execFile } = require("child_process");
 const https = require("https");
-const { deleteStoredFile, saveLocalFile } = require("../lib/storedFiles");
+const { deleteStoredFile, deleteUploadByUrl, saveLocalFile } = require("../lib/storedFiles");
 const { HERO_CATEGORIES, HOME_SLIDER_KEY, categoryById } = require("../lib/heroCategories");
 const { CATEGORY_TILES, TILE_SLUG, tileById } = require("../lib/categoryTiles");
 const {
@@ -53,7 +61,7 @@ function publicCustomer(customer) {
 
 async function refreshProductRating(productId) {
   const stats = await StoreReview.aggregate([
-    { $match: { productId: new mongoose.Types.ObjectId(productId), status: "approved" } },
+    { $match: { productId: String(productId), status: "approved" } },
     {
       $group: {
         _id: "$productId",
@@ -92,7 +100,14 @@ router.post("/auth/register", async (req, res) => {
     }
 
     const passwordHash = await StoreCustomer.hashPassword(password);
-    const customer = await StoreCustomer.create({ name, email, phone, passwordHash });
+    const customer = await StoreCustomer.create({
+      name,
+      email,
+      phone,
+      passwordHash,
+      isActive: true,
+      addresses: [],
+    });
     const token = signCustomerToken(customer);
     res.status(201).json({ success: true, data: { customer: publicCustomer(customer), token } });
   } catch (error) {
@@ -105,8 +120,12 @@ router.post("/auth/login", async (req, res) => {
   try {
     const email = String(req.body?.email || "").trim().toLowerCase();
     const password = String(req.body?.password || "");
-    const customer = await StoreCustomer.findOne({ email, isActive: true });
-    if (!customer || !(await customer.comparePassword(password))) {
+    const customer = await StoreCustomer.findOne({ email });
+    if (
+      !customer ||
+      customer.isActive === false ||
+      !(await customer.comparePassword(password))
+    ) {
       return res.status(401).json({ success: false, message: "Invalid email or password" });
     }
     const token = signCustomerToken(customer);
@@ -360,7 +379,7 @@ router.post("/wishlist", optionalStoreAuth, async (req, res) => {
       });
     }
     const productId = req.body?.productId;
-    if (!mongoose.Types.ObjectId.isValid(productId)) {
+    if (!Types.ObjectId.isValid(productId)) {
       return res.status(400).json({ success: false, message: "Valid productId required" });
     }
     const product = await Product.findOne({ _id: productId, status: "listed" });
@@ -399,6 +418,86 @@ router.delete("/wishlist/:productId", optionalStoreAuth, async (req, res) => {
     res.json({ success: true, message: "Removed" });
   } catch (error) {
     res.status(500).json({ success: false, message: "Failed to remove wishlist item" });
+  }
+});
+
+/* ------------------------ Cart (synced for admin tracking) ------------------------ */
+
+function cartOwnerFilter(req) {
+  if (req.storeCustomer?._id) return { customerId: String(req.storeCustomer._id) };
+  const guestId = String(req.headers["x-guest-id"] || req.query.guestId || "").trim();
+  if (!guestId) return null;
+  return { guestId };
+}
+
+function normalizeCartItems(raw = []) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .slice(0, 50)
+    .map((item) => ({
+      productId: String(item?.productId || ""),
+      slug: String(item?.slug || ""),
+      title: String(item?.title || ""),
+      image: String(item?.image || ""),
+      variantId: item?.variantId ? String(item.variantId) : null,
+      variantLabel: String(item?.variantLabel || ""),
+      unitSalePrice: Number(item?.unitSalePrice) || 0,
+      unitMrp: Number(item?.unitMrp) || 0,
+      qty: Math.max(1, Math.min(99, Number(item?.qty) || 1)),
+      maxQty: Number(item?.maxQty) || 99,
+    }))
+    .filter((item) => item.productId && item.title);
+}
+
+router.get("/cart", optionalStoreAuth, async (req, res) => {
+  try {
+    const owner = cartOwnerFilter(req);
+    if (!owner) {
+      return res.status(400).json({
+        success: false,
+        message: "Login or provide X-Guest-Id header",
+      });
+    }
+    const cart = await StoreCart.findOne(owner).lean();
+    res.json({
+      success: true,
+      data: {
+        items: cart?.items || [],
+        updatedAt: cart?.updatedAt || null,
+      },
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Failed to load cart" });
+  }
+});
+
+router.put("/cart", optionalStoreAuth, async (req, res) => {
+  try {
+    const owner = cartOwnerFilter(req);
+    if (!owner) {
+      return res.status(400).json({
+        success: false,
+        message: "Login or provide X-Guest-Id header",
+      });
+    }
+    const items = normalizeCartItems(req.body?.items);
+    let cart = await StoreCart.findOne(owner);
+    if (cart) {
+      cart.items = items;
+      await cart.save();
+    } else {
+      cart = await StoreCart.create({ ...owner, items });
+    }
+    res.json({
+      success: true,
+      data: {
+        items: cart.items || items,
+        updatedAt: cart.updatedAt || null,
+      },
+    });
+  } catch (error) {
+    console.error("Save cart error:", error);
+    res.status(500).json({ success: false, message: "Failed to save cart" });
   }
 });
 
@@ -499,7 +598,7 @@ router.post("/payments/razorpay/verify", async (req, res) => {
       return res.status(400).json({ success: false, message: "Invalid payment signature" });
     }
 
-    if (storeOrderId && mongoose.Types.ObjectId.isValid(storeOrderId)) {
+    if (storeOrderId && Types.ObjectId.isValid(storeOrderId)) {
       await StoreOrder.findByIdAndUpdate(storeOrderId, {
         paymentMethod: "online",
         paymentStatus: "paid",
@@ -528,7 +627,7 @@ router.post("/payments/cancel-unpaid", async (req, res) => {
     const storeOrderId = req.body?.storeOrderId;
     let order = null;
 
-    if (storeOrderId && mongoose.Types.ObjectId.isValid(storeOrderId)) {
+    if (storeOrderId && Types.ObjectId.isValid(storeOrderId)) {
       order = await StoreOrder.findById(storeOrderId);
     }
 
@@ -588,46 +687,17 @@ router.post("/payments/cancel-unpaid", async (req, res) => {
 /* ------------------------ CMS: banners / blogs / pages ------------------------ */
 
 router.get("/content/home", async (_req, res) => {
+  const { getCached, setCached } = require("../lib/responseCache");
+  const cacheKey = "store:content:home";
+  const cached = getCached(cacheKey);
+  if (cached) {
+    res.set("X-Cache", "HIT");
+    return res.status(cached.status).json(cached.body);
+  }
+
   try {
     const Product = require("../models/Product");
-    const {
-      INTENTIONS,
-      ZODIAC_SIGNS,
-      CATEGORIES,
-      queryCatalog,
-    } = require("../lib/storeCatalog");
-
-    const [banners, posts, categoryCounts] = await Promise.all([
-      StoreBanner.find({ isActive: true }).sort({ sortOrder: 1, createdAt: -1 }),
-      StoreBlogPost.find({ status: "published" }).sort({ publishedAt: -1 }).limit(6),
-      Product.aggregate([
-        { $match: { status: "listed" } },
-        { $group: { _id: "$category", count: { $sum: 1 } } },
-      ]),
-    ]);
-
-    const countMap = Object.fromEntries(categoryCounts.map((c) => [c._id, c.count]));
-
-    // One representative image per category for Explore Categories cards
-    const categoryCards = [];
-    for (const cat of CATEGORIES) {
-      // eslint-disable-next-line no-await-in-loop
-      const sample = await Product.findOne({ status: "listed", category: cat })
-        .select("images title")
-        .lean();
-      categoryCards.push({
-        id: cat,
-        label: categoryById(cat)?.label || cat.split("-").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" "),
-        href: `/shop/${cat}`,
-        productCount: countMap[cat] || 0,
-        image:
-          sample?.images?.find((i) => i.isPrimary)?.url ||
-          sample?.images?.[0]?.url ||
-          "",
-      });
-    }
-
-    const faqs = await readHomeFaqs();
+    const { INTENTIONS, ZODIAC_SIGNS, CATEGORIES } = require("../lib/storeCatalog");
 
     const intentionMeta = {
       Peace: { color: "#7BA3A8", icon: "peace" },
@@ -639,15 +709,73 @@ router.get("/content/home", async (_req, res) => {
       Spirituality: { color: "#6E5A8A", icon: "spirit" },
     };
 
-    const [featured, bestsellers, newArrivals] = await Promise.all([
-      queryCatalog({ featured: "true", limit: 16, sort: "featured" }),
-      queryCatalog({ bestSeller: "true", limit: 16, sort: "best_selling" }),
-      queryCatalog({ isNewArrival: "true", limit: 16, sort: "newest" }),
+    const [
+      banners,
+      posts,
+      listedProducts,
+      faqs,
+      categoryTiles,
+      aboutSection,
+      featuredFinds,
+      screenToSpace,
+      testimonials,
+    ] = await Promise.all([
+      StoreBanner.find({ isActive: true }).sort({ sortOrder: 1, createdAt: -1 }),
+      StoreBlogPost.find({ status: "published" }).sort({ publishedAt: -1 }).limit(6),
+      Product.find({ status: "listed" }).sort({ createdAt: -1 }).lean(),
+      readHomeFaqs(),
+      readCategoryTiles(),
+      readAboutSection(),
+      readFeaturedFinds(),
+      readScreenToSpace(),
+      readTestimonials(),
     ]);
 
-    const listedTotal = await Product.countDocuments({ status: "listed" });
+    const countMap = {};
+    const sampleByCategory = {};
+    for (const product of listedProducts) {
+      const cat = product.category || "other";
+      countMap[cat] = (countMap[cat] || 0) + 1;
+      if (!sampleByCategory[cat]) sampleByCategory[cat] = product;
+    }
 
-    res.json({
+    const categoryCards = CATEGORIES.map((cat) => {
+      const sample = sampleByCategory[cat];
+      return {
+        id: cat,
+        label:
+          categoryById(cat)?.label ||
+          cat
+            .split("-")
+            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+            .join(" "),
+        href: `/shop/${cat}`,
+        productCount: countMap[cat] || 0,
+        image:
+          sample?.images?.find((i) => i.isPrimary)?.url ||
+          sample?.images?.[0]?.url ||
+          "",
+      };
+    });
+
+    const intentionProducts = {};
+    for (const intention of INTENTIONS) {
+      const hit = listedProducts.find((p) =>
+        Array.isArray(p.intentions) ? p.intentions.includes(intention) : false
+      );
+      if (hit) intentionProducts[intention] = hit;
+    }
+
+    const rashiProducts = listedProducts
+      .filter((p) => /राशि|rashi/i.test(String(p.title || "")))
+      .slice(0, 24);
+
+    const latestProducts = listedProducts.slice(0, 20);
+    const featured = listedProducts.filter((p) => p.isFeatured).slice(0, 16);
+    const bestsellers = listedProducts.filter((p) => p.isBestSeller).slice(0, 16);
+    const newArrivals = listedProducts.filter((p) => p.isNewArrival).slice(0, 16);
+
+    const body = {
       success: true,
       data: {
         brand: {
@@ -656,11 +784,11 @@ router.get("/content/home", async (_req, res) => {
         },
         banners,
         homeSliderManaged: true,
-        categoryTiles: await readCategoryTiles(),
-        aboutSection: await readAboutSection(),
-        featuredFinds: await readFeaturedFinds(),
-        screenToSpace: await readScreenToSpace(),
-        testimonials: await readTestimonials(),
+        categoryTiles,
+        aboutSection,
+        featuredFinds,
+        screenToSpace,
+        testimonials,
         trustBadges: [
           { id: "authentic", label: "Authentic & Certified", description: "Curated listed products" },
           { id: "ship", label: "Free Shipping", description: "On eligible orders" },
@@ -674,6 +802,9 @@ router.get("/content/home", async (_req, res) => {
           color: intentionMeta[name]?.color || "#2F4F3E",
           icon: intentionMeta[name]?.icon || "spark",
         })),
+        intentionProducts,
+        rashiProducts,
+        latestProducts,
         categories: categoryCards,
         zodiacSigns: ZODIAC_SIGNS.map((sign) => ({
           id: sign,
@@ -681,9 +812,9 @@ router.get("/content/home", async (_req, res) => {
           href: `/shop?zodiac=${encodeURIComponent(sign)}`,
         })),
         carousels: {
-          featured: featured.items,
-          bestsellers: bestsellers.items,
-          newArrivals: newArrivals.items,
+          featured: featured.length ? featured : latestProducts.slice(0, 16),
+          bestsellers: bestsellers.length ? bestsellers : latestProducts.slice(0, 16),
+          newArrivals: newArrivals.length ? newArrivals : latestProducts.slice(0, 16),
         },
         latestBlogs: posts,
         faqs,
@@ -694,11 +825,15 @@ router.get("/content/home", async (_req, res) => {
           ctaHref: "/contact",
         },
         stats: {
-          listedProducts: listedTotal,
+          listedProducts: listedProducts.length,
           categoryCounts: countMap,
         },
       },
-    });
+    };
+
+    setCached(cacheKey, body, 10000);
+    res.set("X-Cache", "MISS");
+    res.json(body);
   } catch (error) {
     console.error("Home content error:", error);
     res.status(500).json({ success: false, message: "Failed to load home content" });
@@ -779,10 +914,8 @@ router.put("/admin/banners/:id", async (req, res) => {
 });
 
 function removeBannerFile(imageUrl) {
-  if (!imageUrl || !String(imageUrl).startsWith("/uploads/banners/")) return;
-  const file = path.join(__dirname, "..", String(imageUrl).replace(/^\/+/, ""));
-  fs.unlink(file, () => {});
-  deleteStoredFile(path.basename(String(imageUrl))).catch(() => {});
+  if (!imageUrl || !String(imageUrl).startsWith("/uploads/")) return;
+  deleteUploadByUrl(imageUrl).catch(() => {});
 }
 
 const CATEGORY_BANNER_KEY = "category-banner";
@@ -820,7 +953,10 @@ function readBannerFields(body, file, defaultKey = HOME_SLIDER_KEY) {
 
 async function readSiteLogo() {
   const page = await StorePage.findOne({ slug: "site-logo" }).select("content").lean();
-  return page?.content ? String(page.content) : "/tathaastu_logo.png";
+  const value = page?.content ? String(page.content).trim() : "";
+  // Only backend-managed logos (/uploads/...) — never a storefront /public file
+  if (value.startsWith("/uploads/")) return value;
+  return "";
 }
 
 router.get("/admin/home-banners", async (_req, res) => {
@@ -867,21 +1003,21 @@ router.put("/admin/logo", (req, res) => {
 router.delete("/admin/logo", async (_req, res) => {
   try {
     const existing = await StorePage.findOne({ slug: "site-logo" }).select("content").lean();
-    if (existing?.content && existing.content !== "/tathaastu_logo.png") {
+    if (existing?.content) {
       removeBannerFile(existing.content);
     }
     await StorePage.findOneAndUpdate(
       { slug: "site-logo" },
       {
-        $set: { title: "Site logo", content: "/tathaastu_logo.png", isActive: true },
+        $set: { title: "Site logo", content: "", isActive: true },
         $setOnInsert: { slug: "site-logo" },
       },
       { upsert: true, new: true }
     );
-    res.json({ success: true, data: { imageUrl: "/tathaastu_logo.png" }, message: "Logo reset to default" });
+    res.json({ success: true, data: { imageUrl: "" }, message: "Logo removed" });
   } catch (error) {
     console.error("Delete logo error:", error);
-    res.status(500).json({ success: false, message: "Failed to reset logo" });
+    res.status(500).json({ success: false, message: "Failed to remove logo" });
   }
 });
 
@@ -899,10 +1035,15 @@ async function readCategoryTiles() {
   const byId = Object.fromEntries(saved.map((item) => [item.id, item]));
   return CATEGORY_TILES.map((tile) => {
     const custom = byId[tile.id] || {};
+    let image = String(custom.image || tile.image || "");
+    // Migrate legacy storefront /public paths → backend uploads
+    if (image.startsWith("/categories/")) {
+      image = `/uploads${image}`;
+    }
     return {
       ...tile,
       label: String(custom.label || tile.label),
-      image: String(custom.image || tile.image),
+      image,
     };
   });
 }
@@ -973,51 +1114,59 @@ router.delete("/admin/category-tiles/:id/image", async (req, res) => {
     }
     const tiles = await readCategoryTiles();
     const current = tiles.find((tile) => tile.id === base.id);
-    if (current?.image && current.image !== base.image) {
-      removeBannerFile(current.image);
+    if (current?.image) {
+      // Only delete uploaded overrides, keep seed files under /uploads/categories/
+      if (current.image !== base.image && String(current.image).startsWith("/uploads/banners/")) {
+        removeBannerFile(current.image);
+      }
     }
-    const next = tiles.map((tile) => (tile.id === base.id ? { ...tile, image: base.image } : tile));
+    const next = tiles.map((tile) => (tile.id === base.id ? { ...tile, image: base.image || "" } : tile));
     await writeCategoryTiles(next);
-    res.json({ success: true, data: next.find((tile) => tile.id === base.id), message: "Category photo reset to default" });
+    res.json({ success: true, data: next.find((tile) => tile.id === base.id), message: "Category photo reset" });
   } catch (error) {
     console.error("Delete category tile image error:", error);
     res.status(500).json({ success: false, message: "Failed to reset category photo" });
   }
 });
 
-async function aboutMedia(current, body, file) {
+/** About media: direct uploads only (no live/paste URLs). */
+function aboutMedia(current, body, files = {}) {
   let image = String(current?.image || "");
-  const pasted = String(body?.imageUrl || "").trim();
   const removeImage = String(body?.removeImage || "") === "true" || body?.removeImage === true;
   const removeVideo = String(body?.removeVideo || "") === "true" || body?.removeVideo === true;
+  const imageFile = files.image || null;
+  const videoFile = files.video || null;
 
   if (removeImage) {
     if (image) removeBannerFile(image);
     image = "";
-  } else if (file) {
-    const nextImage = `/uploads/banners/${file.filename}`;
-    if (image !== nextImage) removeBannerFile(image);
+  } else if (imageFile) {
+    const nextImage = `/uploads/about/${imageFile.filename}`;
+    if (image && image !== nextImage) removeBannerFile(image);
     image = nextImage;
-  } else if (pasted) {
-    if (image !== pasted) removeBannerFile(image);
-    image = pasted;
-  } else if (body?.imageUrl !== undefined && pasted === "" && !file) {
-    if (image) removeBannerFile(image);
-    image = "";
   } else if (/^https?:\/\//i.test(image)) {
-    image = String(current?.fallbackImage || "");
+    // Drop legacy external URLs — media must live under /uploads
+    image = "";
   }
 
-  let videoUrl = String(body?.videoUrl || "").trim();
+  let videoUrl = String(current?.videoUrl || "");
   let playbackUrl = String(current?.playbackUrl || "");
-  if (removeVideo || !videoUrl) {
+  if (removeVideo) {
     if (playbackUrl) removeTestimonialVideo(playbackUrl);
+    if (videoUrl && videoUrl !== playbackUrl) removeBannerFile(videoUrl);
     playbackUrl = "";
     videoUrl = "";
-  } else if (videoUrl !== String(current?.videoUrl || "") || !playbackUrl) {
-    if (playbackUrl) removeTestimonialVideo(playbackUrl);
-    playbackUrl = await prepareTestimonialVideo(videoUrl);
+  } else if (videoFile) {
+    const nextVideo = `/uploads/about/${videoFile.filename}`;
+    if (playbackUrl && playbackUrl !== nextVideo) removeTestimonialVideo(playbackUrl);
+    if (videoUrl && videoUrl !== nextVideo && videoUrl !== playbackUrl) removeBannerFile(videoUrl);
+    videoUrl = nextVideo;
+    playbackUrl = nextVideo;
+  } else if (/^https?:\/\//i.test(videoUrl) || /^https?:\/\//i.test(playbackUrl)) {
+    videoUrl = "";
+    playbackUrl = "";
   }
+
   return { image, videoUrl, playbackUrl };
 }
 
@@ -1124,22 +1273,24 @@ router.delete("/admin/about/video", async (_req, res) => {
 });
 
 router.put("/admin/about", (req, res) => {
-  uploadBannerImage.single("image")(req, res, async (uploadError) => {
+  uploadAboutMedia.fields([
+    { name: "image", maxCount: 1 },
+    { name: "video", maxCount: 1 },
+  ])(req, res, async (uploadError) => {
     if (uploadError) {
       return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
     }
     try {
       const intro = String(req.body?.intro || "").trim();
+      const imageFile = req.files?.image?.[0] || null;
+      const videoFile = req.files?.video?.[0] || null;
       if (!intro) {
-        if (req.file) removeBannerFile(`/uploads/banners/${req.file.filename}`);
+        if (imageFile) removeBannerFile(`/uploads/about/${imageFile.filename}`);
+        if (videoFile) removeBannerFile(`/uploads/about/${videoFile.filename}`);
         return res.status(400).json({ success: false, message: "Intro text is required" });
       }
       const section = await readAboutSection();
-      const media = await aboutMedia(
-        { ...section, fallbackImage: ABOUT_IMAGE },
-        req.body,
-        req.file,
-      );
+      const media = aboutMedia(section, req.body, { image: imageFile, video: videoFile });
       section.image = media.image && !String(media.image).includes("/about/abhimantrit-banner") ? media.image : "";
       section.videoUrl = media.videoUrl;
       section.playbackUrl = media.playbackUrl;
@@ -1338,10 +1489,8 @@ function runFfmpeg(args) {
 }
 
 function removeTestimonialVideo(fileUrl) {
-  if (!fileUrl || !String(fileUrl).startsWith("/uploads/testimonials/")) return;
-  const file = path.join(__dirname, "..", String(fileUrl).replace(/^\/+/, ""));
-  fs.unlink(file, () => {});
-  deleteStoredFile(path.basename(String(fileUrl))).catch(() => {});
+  if (!fileUrl || !String(fileUrl).startsWith("/uploads/")) return;
+  deleteUploadByUrl(fileUrl).catch(() => {});
 }
 
 async function prepareTestimonialVideo(videoUrl) {
@@ -1513,10 +1662,8 @@ const DEFAULT_FEATURED = {
 };
 
 function removeFeaturedFile(fileUrl) {
-  if (!fileUrl || !String(fileUrl).startsWith("/uploads/featured/")) return;
-  const file = path.join(__dirname, "..", String(fileUrl).replace(/^\/+/, ""));
-  fs.unlink(file, () => {});
-  deleteStoredFile(path.basename(String(fileUrl))).catch(() => {});
+  if (!fileUrl || !String(fileUrl).startsWith("/uploads/")) return;
+  deleteUploadByUrl(fileUrl).catch(() => {});
 }
 
 async function readFeaturedFinds() {
@@ -1665,82 +1812,16 @@ const DEFAULT_SCREEN_TO_SPACE = {
   title: "from screen to space, seamlessly",
   subtitle: "",
   isActive: true,
-  items: [
-    {
-      id: "reel-1",
-      overlayTag: "",
-      videoUrl: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-      imageUrl: "https://images.unsplash.com/photo-1544787219-7f47ccb76574?w=800&q=80",
-      productTitle: "Arra Brass Tea Pan With Wooden Handle",
-      productPrice: 4581,
-      productImage: "https://images.unsplash.com/photo-1544787219-7f47ccb76574?w=300&q=80",
-      productSlug: "arra-brass-tea-pan-with-wooden-handle",
-      buttonText: "SHOP NOW",
-      dotsCount: 4,
-      isActive: true,
-    },
-    {
-      id: "reel-2",
-      overlayTag: "",
-      videoUrl: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerEscapes.mp4",
-      imageUrl: "https://images.unsplash.com/photo-1608755728617-aefab37d2edd?w=800&q=80",
-      productTitle: "Kanchdeep Diya Set of 24",
-      productPrice: 1690,
-      productImage: "https://images.unsplash.com/photo-1608755728617-aefab37d2edd?w=300&q=80",
-      productSlug: "kanchdeep-diya-set-of-24",
-      buttonText: "SHOP NOW",
-      dotsCount: 4,
-      isActive: true,
-    },
-    {
-      id: "reel-3",
-      overlayTag: "",
-      videoUrl: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerFun.mp4",
-      imageUrl: "https://images.unsplash.com/photo-1578749556568-bc2c40e68b61?w=800&q=80",
-      productTitle: "Fiore Ceramic Serving Bowl",
-      productPrice: 2150,
-      productImage: "https://images.unsplash.com/photo-1578749556568-bc2c40e68b61?w=300&q=80",
-      productSlug: "fiore-ceramic-serving-bowl",
-      buttonText: "SHOP NOW",
-      dotsCount: 4,
-      isActive: true,
-    },
-    {
-      id: "reel-4",
-      overlayTag: "1. Beal Gond Katira cooler",
-      videoUrl: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerJoyBlazes.mp4",
-      imageUrl: "https://images.unsplash.com/photo-1513558161293-cdaf765ed2fd?w=800&q=80",
-      productTitle: "Dewy Glass Jug With Wooden Lid",
-      productPrice: 2508,
-      productImage: "https://images.unsplash.com/photo-1513558161293-cdaf765ed2fd?w=300&q=80",
-      productSlug: "dewy-glass-jug-with-wooden-lid",
-      buttonText: "SHOP NOW",
-      dotsCount: 4,
-      isActive: true,
-    },
-    {
-      id: "reel-5",
-      overlayTag: "",
-      videoUrl: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/WeAreGoingOnBullrun.mp4",
-      imageUrl: "https://images.unsplash.com/photo-1611652022419-a9419f74343d?w=800&q=80",
-      productTitle: "Handcrafted Brass Dhoop Dani & Lamp",
-      productPrice: 1850,
-      productImage: "https://images.unsplash.com/photo-1611652022419-a9419f74343d?w=300&q=80",
-      productSlug: "handcrafted-brass-dhoop-dani-lamp",
-      buttonText: "SHOP NOW",
-      dotsCount: 4,
-      isActive: true,
-    },
-  ],
+  items: [],
 };
 
 async function readScreenToSpace() {
   const page = await StorePage.findOne({ slug: SCREEN_TO_SPACE_SLUG }).select("content").lean();
-  if (!page?.content) return DEFAULT_SCREEN_TO_SPACE;
+  if (!page?.content) return { ...DEFAULT_SCREEN_TO_SPACE };
   try {
     const saved = JSON.parse(page.content);
-    if (!saved || typeof saved !== "object") return DEFAULT_SCREEN_TO_SPACE;
-    const items = Array.isArray(saved.items) && saved.items.length ? saved.items : DEFAULT_SCREEN_TO_SPACE.items;
+    if (!saved || typeof saved !== "object") return { ...DEFAULT_SCREEN_TO_SPACE };
+    const items = Array.isArray(saved.items) ? saved.items : [];
     return {
       title: String(saved.title || DEFAULT_SCREEN_TO_SPACE.title).trim(),
       subtitle: String(saved.subtitle || "").trim(),
@@ -1815,7 +1896,7 @@ router.put("/admin/screen-to-space", async (req, res) => {
       title,
       subtitle,
       isActive,
-      items: cleanItems.length ? cleanItems : DEFAULT_SCREEN_TO_SPACE.items,
+      items: cleanItems,
     };
 
     await writeScreenToSpace(nextData);
@@ -1909,25 +1990,32 @@ router.delete("/admin/faqs", async (_req, res) => {
 });
 
 router.put("/admin/about/features/:id", (req, res) => {
-  uploadBannerImage.single("image")(req, res, async (uploadError) => {
+  uploadAboutMedia.fields([
+    { name: "image", maxCount: 1 },
+    { name: "video", maxCount: 1 },
+  ])(req, res, async (uploadError) => {
     if (uploadError) {
       return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
     }
     try {
+      const imageFile = req.files?.image?.[0] || null;
+      const videoFile = req.files?.video?.[0] || null;
       const base = aboutFeatureById(req.params.id);
       if (!base) {
-        if (req.file) removeBannerFile(`/uploads/banners/${req.file.filename}`);
+        if (imageFile) removeBannerFile(`/uploads/about/${imageFile.filename}`);
+        if (videoFile) removeBannerFile(`/uploads/about/${videoFile.filename}`);
         return res.status(404).json({ success: false, message: "Point not found" });
       }
       const title = String(req.body?.title || "").trim();
       const description = String(req.body?.description || "").trim();
       if (!title || !description) {
-        if (req.file) removeBannerFile(`/uploads/banners/${req.file.filename}`);
+        if (imageFile) removeBannerFile(`/uploads/about/${imageFile.filename}`);
+        if (videoFile) removeBannerFile(`/uploads/about/${videoFile.filename}`);
         return res.status(400).json({ success: false, message: "Title and description are required" });
       }
       const section = await readAboutSection();
       const current = section.features.find((item) => item.id === base.id);
-      const media = await aboutMedia({ ...current, fallbackImage: "" }, req.body, req.file);
+      const media = aboutMedia(current, req.body, { image: imageFile, video: videoFile });
       section.features = section.features.map((item) =>
         item.id === base.id
           ? {
@@ -2161,7 +2249,7 @@ router.get("/admin/home-blogs", async (_req, res) => {
 });
 
 router.put("/admin/home-blogs", (req, res) => {
-  uploadTestimonialImages.any()(req, res, async (uploadError) => {
+  uploadBlogMedia.any()(req, res, async (uploadError) => {
     if (uploadError) {
       return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
     }
@@ -2183,31 +2271,31 @@ router.put("/admin/home-blogs", (req, res) => {
         if (!id) continue;
         const post = await StoreBlogPost.findById(id);
         if (!post) continue;
-        const file = files.find((entry) => entry.fieldname === `image_${index}`);
-        let coverImage = String(item?.coverImage || "").trim();
-        const videoUrl = String(item?.videoUrl || "").trim();
-        if (file) {
-          const next = `/uploads/banners/${file.filename}`;
+        const imageFile = files.find((entry) => entry.fieldname === `image_${index}`);
+        const videoFile = files.find((entry) => entry.fieldname === `video_${index}`);
+
+        let coverImage = String(post.coverImage || "").trim();
+        if (imageFile) {
+          const next = `/uploads/blogs/${imageFile.filename}`;
           if (coverImage && coverImage !== next) removeBannerFile(coverImage);
           coverImage = next;
-        } else if (post.coverImage && post.coverImage !== coverImage) {
-          removeBannerFile(post.coverImage);
+        } else if (/^https?:\/\//i.test(coverImage)) {
+          coverImage = "";
         }
-        let playbackUrl = "";
-        if (videoUrl) {
-          const sameVideo = post.videoUrl === videoUrl && post.playbackUrl;
-          const reusedFile = String(post.playbackUrl || "").startsWith("/uploads/testimonials/")
-            ? path.join(__dirname, "..", String(post.playbackUrl).replace(/^\/+/, ""))
-            : "";
-          if (sameVideo && (!reusedFile || fs.existsSync(reusedFile))) {
-            playbackUrl = post.playbackUrl;
-          } else {
-            if (post.playbackUrl && post.playbackUrl !== playbackUrl) removeTestimonialVideo(post.playbackUrl);
-            playbackUrl = await prepareTestimonialVideo(videoUrl);
-          }
-        } else if (post.playbackUrl) {
-          removeTestimonialVideo(post.playbackUrl);
+
+        let videoUrl = String(post.videoUrl || "").trim();
+        let playbackUrl = String(post.playbackUrl || "").trim();
+        if (videoFile) {
+          const nextVideo = `/uploads/blogs/${videoFile.filename}`;
+          if (playbackUrl && playbackUrl !== nextVideo) removeTestimonialVideo(playbackUrl);
+          if (videoUrl && videoUrl !== nextVideo && videoUrl !== playbackUrl) removeBannerFile(videoUrl);
+          videoUrl = nextVideo;
+          playbackUrl = nextVideo;
+        } else if (/^https?:\/\//i.test(videoUrl) || /^https?:\/\//i.test(playbackUrl)) {
+          videoUrl = "";
+          playbackUrl = "";
         }
+
         post.coverImage = coverImage;
         post.videoUrl = videoUrl;
         post.playbackUrl = playbackUrl;
@@ -2369,7 +2457,9 @@ router.post("/admin/cms/seed", async (_req, res) => {
         excerpt: "A simple guide to mukhi, intention and daily wear.",
         content:
           "Start with your intention — peace, protection, wealth or health — then match mukhi guidance and consult an expert when unsure.",
-        coverImage: "https://images.unsplash.com/photo-1608571423902-eed4a5ad8108?w=1200",
+        coverImage: "",
+        videoUrl: "",
+        playbackUrl: "",
         tags: ["rudraksha", "guide"],
         status: "published",
         publishedAt: new Date(),

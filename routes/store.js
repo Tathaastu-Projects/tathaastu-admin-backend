@@ -1,5 +1,5 @@
 const express = require("express");
-const mongoose = require("mongoose");
+const { Types } = require("../lib/fileDb");
 const Product = require("../models/Product");
 const StoreOrder = require("../models/StoreOrder");
 const StoreLead = require("../models/StoreLead");
@@ -18,6 +18,8 @@ const {
   buildMegaMenu,
 } = require("../lib/storeCatalog");
 const { decrementStock, restoreStock } = require("../lib/storeStock");
+const { optionalStoreAuth } = require("../middleware/storeAuth");
+const StoreCart = require("../models/StoreCart");
 
 const router = express.Router();
 
@@ -91,12 +93,13 @@ function resolveLinePricing(product, variant) {
  * Nav + filter constants for the storefront.
  */
 router.get("/meta", async (_req, res) => {
-  let logoUrl = "/tathaastu_logo.png";
+  let logoUrl = "";
   try {
     const logo = await StorePage.findOne({ slug: "site-logo" }).select("content").lean();
-    if (logo?.content) logoUrl = String(logo.content);
+    const value = logo?.content ? String(logo.content).trim() : "";
+    if (value.startsWith("/uploads/")) logoUrl = value;
   } catch (_error) {
-    logoUrl = "/tathaastu_logo.png";
+    logoUrl = "";
   }
   res.json({
     success: true,
@@ -170,6 +173,14 @@ router.get("/menu", (_req, res) => {
  * Optional: includeFacets=true
  */
 router.get("/catalog", async (req, res) => {
+  const { getCached, setCached } = require("../lib/responseCache");
+  const cacheKey = `store:catalog:${JSON.stringify(req.query || {})}`;
+  const cached = getCached(cacheKey);
+  if (cached) {
+    res.set("X-Cache", "HIT");
+    return res.status(cached.status).json(cached.body);
+  }
+
   try {
     const result = await queryCatalog(req.query);
     const payload = {
@@ -189,6 +200,8 @@ router.get("/catalog", async (req, res) => {
       payload.facets = facets.facets;
     }
 
+    setCached(cacheKey, payload, 8000);
+    res.set("X-Cache", "MISS");
     res.json(payload);
   } catch (error) {
     console.error("Store catalog error:", error);
@@ -379,7 +392,7 @@ router.put("/admin/collections/:slug", async (req, res) => {
  * POST /api/store/orders
  * Create a COD store order. Re-validates listed products, prices, and stock from DB.
  */
-router.post("/orders", async (req, res) => {
+router.post("/orders", optionalStoreAuth, async (req, res) => {
   const decremented = [];
 
   try {
@@ -390,9 +403,10 @@ router.post("/orders", async (req, res) => {
     const paymentMethod = body.paymentMethod === "online" ? "online" : "cod";
     const notes = String(body.notes || "").trim();
 
-    const name = String(customer.name || "").trim();
-    const phone = String(customer.phone || "").trim();
-    const email = String(customer.email || "").trim().toLowerCase();
+    const name = String(customer.name || req.storeCustomer?.name || "").trim();
+    const phone = String(customer.phone || req.storeCustomer?.phone || "").trim();
+    const email = String(customer.email || req.storeCustomer?.email || "").trim().toLowerCase();
+    const customerId = req.storeCustomer?._id ? String(req.storeCustomer._id) : "";
 
     if (!name || !phone) {
       return res.status(400).json({ success: false, message: "Customer name and phone are required" });
@@ -413,7 +427,7 @@ router.post("/orders", async (req, res) => {
       const productId = raw.productId;
       const quantity = Math.max(1, Math.min(99, Number(raw.quantity) || 1));
 
-      if (!mongoose.Types.ObjectId.isValid(productId)) {
+      if (!Types.ObjectId.isValid(productId)) {
         return res.status(400).json({ success: false, message: `Invalid product id: ${productId}` });
       }
 
@@ -431,13 +445,15 @@ router.post("/orders", async (req, res) => {
 
       if (hasVariants) {
         const variantId = raw.variantId;
-        if (!variantId || !mongoose.Types.ObjectId.isValid(variantId)) {
+        if (!variantId || !Types.ObjectId.isValid(variantId)) {
           return res.status(400).json({
             success: false,
             message: `Please select a variant for ${product.title}`,
           });
         }
-        variant = product.variants.id(variantId);
+        variant = (product.variants || []).find(
+          (entry) => String(entry?._id) === String(variantId)
+        );
         if (!variant || variant.isActive === false) {
           return res.status(400).json({
             success: false,
@@ -510,6 +526,7 @@ router.post("/orders", async (req, res) => {
     const orderNumber = await generateOrderNumber();
     const order = await StoreOrder.create({
       orderNumber,
+      customerId: customerId || undefined,
       customer: { name, email, phone },
       shippingAddress: {
         line1: String(shippingAddress.line1).trim(),
@@ -529,6 +546,19 @@ router.post("/orders", async (req, res) => {
       stockDecremented: true,
     });
 
+    // Clear saved cart after successful order
+    if (customerId) {
+      try {
+        const cart = await StoreCart.findOne({ customerId });
+        if (cart) {
+          cart.items = [];
+          await cart.save();
+        }
+      } catch (_e) {
+        /* ignore cart clear errors */
+      }
+    }
+
     res.status(201).json({
       success: true,
       data: {
@@ -540,6 +570,7 @@ router.post("/orders", async (req, res) => {
         pricing: order.pricing,
         items: order.items,
         customer: order.customer,
+        customerId: order.customerId || null,
         createdAt: order.createdAt,
       },
       message: "Order placed successfully",

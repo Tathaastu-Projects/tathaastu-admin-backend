@@ -1,5 +1,5 @@
 /**
- * Orchestrates a fresh local DB seed for admin + store:
+ * Orchestrates a fresh local file-DB seed for admin + store:
  * 1) remedies  2) sample products  3) store collections  4) CMS + coupons
  *
  * For a full catalog import, also run:
@@ -9,7 +9,7 @@
 const path = require("path");
 const { spawnSync } = require("child_process");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
-const mongoose = require("mongoose");
+const { ensureStorageLayout } = require("../lib/fileDb");
 const StoreCollection = require("../models/StoreCollection");
 const StoreCoupon = require("../models/StoreCoupon");
 const { StoreBanner, StoreBlogPost, StorePage } = require("../models/StoreCms");
@@ -29,8 +29,7 @@ function runNodeScript(relPath) {
 }
 
 async function seedStoreExtras() {
-  const uri = process.env.MONGODB_URI || "mongodb://localhost:27017/tathasstu-admin";
-  await mongoose.connect(uri);
+  ensureStorageLayout();
   console.log("\n▶ Seeding store collections + CMS…");
 
   for (const item of storeCollectionsSeed) {
@@ -47,10 +46,11 @@ async function seedStoreExtras() {
       key: "home-hero",
       title: "Authentic Rudraksha & Gemstones",
       subtitle: "Lab-inspired curation for intention-led living",
-      imageUrl: "https://images.unsplash.com/photo-1515562141207-7a88fb7ce338?w=1600",
+      imageUrl: "",
       ctaLabel: "Shop Collection",
       ctaHref: "/shop",
       sortOrder: 1,
+      isActive: true,
     },
     {
       key: "home-promo",
@@ -59,6 +59,7 @@ async function seedStoreExtras() {
       ctaLabel: "Explore",
       ctaHref: "/intention/Wealth",
       sortOrder: 2,
+      isActive: true,
     },
   ];
   for (const b of banners) {
@@ -73,7 +74,7 @@ async function seedStoreExtras() {
       excerpt: "A simple guide to mukhi, intention and daily wear.",
       content:
         "Start with your intention — peace, protection, wealth or health — then match mukhi guidance and consult an expert when unsure.",
-      coverImage: "https://images.unsplash.com/photo-1608571423902-eed4a5ad8108?w=1200",
+      coverImage: "",
       tags: ["rudraksha", "guide"],
       status: "published",
       publishedAt: new Date(),
@@ -131,24 +132,20 @@ async function seedStoreExtras() {
     { upsert: true }
   );
 
-  console.log("  CMS banners, blog, pages, coupons upserted");
-  await mongoose.disconnect();
+  console.log("  CMS banners, blog, pages, coupons upserted into storage/data/");
 }
 
 async function main() {
+  ensureStorageLayout();
   runNodeScript("seedRemedies.js");
   runNodeScript("seedProducts.js");
   await seedStoreExtras();
-  console.log("\n✅ Seed complete. Storefront should load catalog + home CMS.");
+  console.log("\n✅ Seed complete. Storefront should load catalog + home CMS from file storage.");
   console.log("   Optional full import: npm run import:gemsmantra");
+  console.log("   Upload product/banner images via Admin Panel — they save under uploads/ + storage/images/");
 }
 
-main().catch(async (err) => {
+main().catch((err) => {
   console.error("Seed failed:", err);
-  try {
-    await mongoose.disconnect();
-  } catch {
-    /* ignore */
-  }
   process.exit(1);
 });

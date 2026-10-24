@@ -1,12 +1,13 @@
 const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
-const { saveLocalFile, deleteStoredFile } = require("../lib/storedFiles");
+const { mirrorToStorage } = require("../lib/storedFiles");
+const { ensureStorageLayout } = require("../lib/fileDb/paths");
+const { compressVideoFile, isVideoFile } = require("../lib/compressVideo");
 
-const uploadRoot = path.join(__dirname, "..", "uploads", "products");
-fs.mkdirSync(uploadRoot, { recursive: true });
+ensureStorageLayout();
 
-function mongoDiskStorage(rootDir) {
+function diskStorage(rootDir, storageSubdir) {
   return {
     _handleFile(_req, file, cb) {
       fs.mkdirSync(rootDir, { recursive: true });
@@ -19,31 +20,45 @@ function mongoDiskStorage(rootDir) {
       file.stream.pipe(out);
       out.on("error", cb);
       out.on("finish", () => {
-        saveLocalFile(filename, fullPath, file.mimetype)
-          .then(() => {
-            cb(null, {
-              destination: rootDir,
-              filename,
-              path: fullPath,
-              size: out.bytesWritten,
-            });
-          })
-          .catch((error) => {
-            fs.unlink(fullPath, () => {});
-            cb(error);
+        const finishUpload = (finalPath, finalName, finalSize) => {
+          try {
+            mirrorToStorage(storageSubdir, finalName, finalPath);
+          } catch (_e) {
+            /* ignore mirror errors */
+          }
+          cb(null, {
+            destination: rootDir,
+            filename: finalName,
+            path: finalPath,
+            size: finalSize,
           });
+        };
+
+        // Auto-compress videos after upload (smaller file, near-same quality)
+        if (isVideoFile(fullPath, file.mimetype)) {
+          compressVideoFile(fullPath, { mimetype: file.mimetype })
+            .then((result) => {
+              finishUpload(result.path, result.filename, result.size || out.bytesWritten);
+            })
+            .catch(() => {
+              finishUpload(fullPath, filename, out.bytesWritten);
+            });
+          return;
+        }
+
+        finishUpload(fullPath, filename, out.bytesWritten);
       });
     },
     _removeFile(_req, file, cb) {
       if (file.path) fs.unlink(file.path, () => {});
-      deleteStoredFile(file.filename)
-        .catch(() => {})
-        .finally(() => cb(null));
+      cb(null);
     },
   };
 }
 
-const storage = mongoDiskStorage(uploadRoot);
+const uploadRoot = path.join(__dirname, "..", "uploads", "products");
+fs.mkdirSync(uploadRoot, { recursive: true });
+const storage = diskStorage(uploadRoot, "products");
 
 function fileFilter(_req, file, cb) {
   if (!file.mimetype?.startsWith("image/")) {
@@ -55,13 +70,12 @@ function fileFilter(_req, file, cb) {
 const uploadProductImages = multer({
   storage,
   fileFilter,
-  limits: { fileSize: 5 * 1024 * 1024, files: 8 },
+  limits: { fileSize: 8 * 1024 * 1024, files: 12 },
 });
 
 const bannerRoot = path.join(__dirname, "..", "uploads", "banners");
 fs.mkdirSync(bannerRoot, { recursive: true });
-
-const bannerStorage = mongoDiskStorage(bannerRoot);
+const bannerStorage = diskStorage(bannerRoot, "banners");
 
 function bannerFileFilter(_req, file, cb) {
   const name = String(file.originalname || "");
@@ -84,8 +98,7 @@ const uploadTestimonialImages = multer({
 
 const featuredRoot = path.join(__dirname, "..", "uploads", "featured");
 fs.mkdirSync(featuredRoot, { recursive: true });
-
-const featuredStorage = mongoDiskStorage(featuredRoot);
+const featuredStorage = diskStorage(featuredRoot, "featured");
 
 function featuredFileFilter(_req, file, cb) {
   const name = String(file.originalname || "");
@@ -95,21 +108,43 @@ function featuredFileFilter(_req, file, cb) {
   cb(null, true);
 }
 
+// Higher upload ceiling — files are auto-compressed after save
+const VIDEO_UPLOAD_MAX = 120 * 1024 * 1024; // 120 MB
+
 const uploadFeaturedMedia = multer({
   storage: featuredStorage,
   fileFilter: featuredFileFilter,
-  limits: { fileSize: 40 * 1024 * 1024, files: 2 },
+  limits: { fileSize: VIDEO_UPLOAD_MAX, files: 2 },
 });
 
 const reelsRoot = path.join(__dirname, "..", "uploads", "reels");
 fs.mkdirSync(reelsRoot, { recursive: true });
-
-const reelsStorage = mongoDiskStorage(reelsRoot);
+const reelsStorage = diskStorage(reelsRoot, "reels");
 
 const uploadReelsMedia = multer({
   storage: reelsStorage,
   fileFilter: featuredFileFilter,
-  limits: { fileSize: 50 * 1024 * 1024, files: 5 },
+  limits: { fileSize: VIDEO_UPLOAD_MAX, files: 5 },
+});
+
+const aboutRoot = path.join(__dirname, "..", "uploads", "about");
+fs.mkdirSync(aboutRoot, { recursive: true });
+const aboutStorage = diskStorage(aboutRoot, "about");
+
+const uploadAboutMedia = multer({
+  storage: aboutStorage,
+  fileFilter: featuredFileFilter,
+  limits: { fileSize: VIDEO_UPLOAD_MAX, files: 2 },
+});
+
+const blogsRoot = path.join(__dirname, "..", "uploads", "blogs");
+fs.mkdirSync(blogsRoot, { recursive: true });
+const blogsStorage = diskStorage(blogsRoot, "blogs");
+
+const uploadBlogMedia = multer({
+  storage: blogsStorage,
+  fileFilter: featuredFileFilter,
+  limits: { fileSize: VIDEO_UPLOAD_MAX, files: 20 },
 });
 
 module.exports = {
@@ -118,9 +153,12 @@ module.exports = {
   uploadTestimonialImages,
   uploadFeaturedMedia,
   uploadReelsMedia,
+  uploadAboutMedia,
+  uploadBlogMedia,
   uploadRoot,
   bannerRoot,
   featuredRoot,
   reelsRoot,
+  aboutRoot,
+  blogsRoot,
 };
-

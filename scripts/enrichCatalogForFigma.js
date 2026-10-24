@@ -8,7 +8,8 @@
  */
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
-const mongoose = require("mongoose");
+const { ensureStorageLayout } = require("../lib/fileDb");
+ensureStorageLayout();
 const Product = require("../models/Product");
 const StoreReview = require("../models/StoreReview");
 const { StoreBanner, StoreBlogPost, StorePage } = require("../models/StoreCms");
@@ -149,7 +150,7 @@ async function seedHomeContent() {
       excerpt: "Match mukhi and intention — a simple starter guide for first-time buyers.",
       content:
         "Begin with your intention (peace, protection, wealth), then explore mukhi guidance. Prefer certified beads and consult an expert when unsure.",
-      coverImage: "https://images.unsplash.com/photo-1608571423902-eed4a5ad8108?w=1200",
+      coverImage: "",
       tags: ["rudraksha", "guide"],
       status: "published",
       publishedAt: new Date(),
@@ -160,7 +161,7 @@ async function seedHomeContent() {
       excerpt: "Metal, finger and day of week tips for planetary gemstones.",
       content:
         "Traditional Vedic practice pairs each gemstone with a planet, metal and finger. Always verify authenticity and energization before regular wear.",
-      coverImage: "https://images.unsplash.com/photo-1515562141207-7a88fb7ce338?w=1200",
+      coverImage: "",
       tags: ["gemstone", "guide"],
       status: "published",
       publishedAt: new Date(),
@@ -171,7 +172,7 @@ async function seedHomeContent() {
       excerpt: "Why intention tags help you find spiritual products faster.",
       content:
         "Instead of endless scrolling, filter by Peace, Wealth, Protection and more — every Tathaastu listed product can carry intention tags.",
-      coverImage: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=1200",
+      coverImage: "",
       tags: ["intention", "shopping"],
       status: "published",
       publishedAt: new Date(),
@@ -231,8 +232,7 @@ async function seedHomeContent() {
 }
 
 async function main() {
-  await mongoose.connect(process.env.MONGODB_URI || "mongodb://localhost:27017/tathasstu-admin");
-  console.log("Enriching catalog for Figma-filled storefront...");
+    console.log("Enriching catalog for Figma-filled storefront...");
 
   const products = await Product.find({ status: "listed" });
   console.log(`Listed products: ${products.length}`);
@@ -344,14 +344,12 @@ async function main() {
     ]),
   };
   console.log(JSON.stringify(summary, null, 2));
-  await mongoose.disconnect();
-}
+  }
 
 main().catch(async (e) => {
   console.error(e);
   try {
-    await mongoose.disconnect();
-  } catch (_) {
+      } catch (_) {
     /* ignore */
   }
   process.exit(1);

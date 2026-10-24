@@ -7,7 +7,8 @@
  */
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, "..", ".env") });
-const mongoose = require("mongoose");
+const { ensureStorageLayout } = require("../lib/fileDb");
+ensureStorageLayout();
 const Product = require("../models/Product");
 
 // Reuse mapping helpers by requiring the main importer logic inline (duplicated lightly)
@@ -184,8 +185,7 @@ async function upsertMapped(mapped) {
 }
 
 async function main() {
-  await mongoose.connect(process.env.MONGODB_URI || "mongodb://localhost:27017/tathasstu-admin");
-  const stats = { imported: 0, updated: 0, skipped: 0 };
+    const stats = { imported: 0, updated: 0, skipped: 0 };
 
   for (const col of COLLECTIONS) {
     console.log(`Collection ${col.handle} (${col.forceCategory})...`);
@@ -206,14 +206,12 @@ async function main() {
   }
 
   console.log(JSON.stringify(stats, null, 2));
-  await mongoose.disconnect();
-}
+  }
 
 main().catch(async (e) => {
   console.error(e);
   try {
-    await mongoose.disconnect();
-  } catch (_) {
+      } catch (_) {
     /* ignore */
   }
   process.exit(1);

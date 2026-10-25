@@ -45,11 +45,6 @@ app.use(
 console.log(`📁 File database: ${DATA_DIR}`);
 console.log(`🖼️  Media storage: ${path.join(STORAGE_ROOT, "images")} (+ uploads/)`);
 
-const { ensureDefaultAdmin, DEFAULT_ADMIN_EMAIL } = require("./lib/ensureDefaultAdmin");
-ensureDefaultAdmin()
-  .then(() => console.log(`🔐 Admin login: ${DEFAULT_ADMIN_EMAIL}`))
-  .catch((err) => console.error("Default admin seed failed:", err.message));
-
 app.use("/api/auth", require("./routes/auth"));
 app.use("/api/queries", require("./routes/queries"));
 app.use("/api/users", require("./routes/users"));

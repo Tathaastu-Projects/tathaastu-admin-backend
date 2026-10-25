@@ -73,7 +73,12 @@ if (!PORT) {
   process.exit(1);
 }
 
-app.listen(Number(PORT), () => {
+const server = app.listen(Number(PORT), () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
   console.log("✅ Using local file storage (no MongoDB)");
 });
+
+// Video upload + ffmpeg compress can take several minutes
+server.timeout = 5 * 60 * 1000;
+server.headersTimeout = 5 * 60 * 1000 + 10_000;
+server.requestTimeout = 5 * 60 * 1000;

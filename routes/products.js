@@ -720,6 +720,20 @@ router.put("/:id", async (req, res) => {
     Object.assign(product, payload, { updatedBy: actor });
     await product.save();
 
+    // Remove old image files that are no longer on the product (DB + disk/storage)
+    const beforeUrls = (before.images || []).map((img) => String(img?.url || "").trim()).filter(Boolean);
+    const afterUrls = new Set(
+      (product.images || []).map((img) => String(img?.url || "").trim()).filter(Boolean)
+    );
+    const removedUrls = beforeUrls.filter((url) => !afterUrls.has(url));
+    for (const url of removedUrls) {
+      try {
+        await deleteUploadByUrl(url);
+      } catch (fileErr) {
+        console.warn("Orphan product image delete warning:", fileErr.message);
+      }
+    }
+
     const changes = pickChanges(before, product.toObject(), [
       "title",
       "sku",
@@ -736,6 +750,9 @@ router.put("/:id", async (req, res) => {
       "linkedRemedyId",
       "linkedRemedyName",
     ]);
+    if (removedUrls.length) {
+      changes.removedImages = removedUrls;
+    }
 
     let action = "update";
     if (changes.mrp || changes.salePrice) action = "price_change";
@@ -745,9 +762,16 @@ router.put("/:id", async (req, res) => {
       if (payload.status === "unlisted") action = "unlist";
       if (payload.status === "draft") action = "draft";
     }
+    if (removedUrls.length && action === "update") action = "image_remove";
 
     await writeAudit({ product, action, actor, actorEmail, changes });
-    res.json({ success: true, data: product, message: "Product updated" });
+    res.json({
+      success: true,
+      data: product,
+      message: removedUrls.length
+        ? `Product updated (${removedUrls.length} old image${removedUrls.length === 1 ? "" : "s"} removed)`
+        : "Product updated",
+    });
   } catch (error) {
     console.error("Update product error:", error);
     res.status(500).json({ success: false, message: error.message || "Failed to update product" });
@@ -864,6 +888,82 @@ router.post("/:id/images", (req, res) => {
       });
     }
   });
+});
+
+/** Remove one image from a product (DB + disk). Body/query: { url } */
+router.delete("/:id/images", async (req, res) => {
+  try {
+    const imageUrl = String(req.body?.url || req.query?.url || "").trim();
+    if (!imageUrl) {
+      return res.status(400).json({ success: false, message: "Image url is required" });
+    }
+
+    const { actor, actorEmail } = actorFrom(req);
+    let updatedProduct = null;
+    let removed = false;
+
+    await updateCollection("products", (docs) => {
+      const idx = docs.findIndex((d) => idsEqual(d._id, req.params.id));
+      if (idx < 0) return docs;
+      const doc = docs[idx];
+      const images = Array.isArray(doc.images) ? [...doc.images] : [];
+      const next = images.filter((img) => String(img?.url || "").trim() !== imageUrl);
+      if (next.length === images.length) {
+        updatedProduct = doc;
+        return docs;
+      }
+      removed = true;
+      if (next.length && !next.some((img) => img.isPrimary)) {
+        next[0].isPrimary = true;
+      }
+      doc.images = next;
+      doc.updatedBy = actor;
+      doc.updatedAt = new Date().toISOString();
+      docs[idx] = doc;
+      updatedProduct = doc;
+      return docs;
+    });
+
+    if (!updatedProduct) {
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+    if (!removed) {
+      return res.status(404).json({ success: false, message: "Image not found on this product" });
+    }
+
+    try {
+      await deleteUploadByUrl(imageUrl);
+    } catch (fileErr) {
+      console.warn("Image file delete warning:", fileErr.message);
+    }
+
+    try {
+      await writeAudit({
+        product: updatedProduct,
+        action: "image_remove",
+        actor,
+        actorEmail,
+        changes: { removed: [imageUrl] },
+      });
+    } catch (auditErr) {
+      console.warn("Image remove audit warning:", auditErr.message);
+    }
+
+    res.json({
+      success: true,
+      data: updatedProduct,
+      message: "Image removed from product and storage",
+    });
+  } catch (error) {
+    console.error("Remove product image error:", error);
+    const busy = error.code === "DB_BUSY" || /busy|lock/i.test(String(error.message || ""));
+    res.status(busy ? 409 : 500).json({
+      success: false,
+      message: busy
+        ? "Another device is saving right now. Wait 2 seconds and try again."
+        : error.message || "Failed to remove image",
+    });
+  }
 });
 
 router.delete("/:id", async (req, res) => {

@@ -1228,6 +1228,9 @@ async function readCategoryTiles() {
     }
     return {
       ...tile,
+      // Always use canonical category route (never stale saved href)
+      href: tile.href,
+      category: tile.category,
       label: String(custom.label || tile.label),
       image,
     };

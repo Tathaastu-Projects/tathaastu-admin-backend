@@ -67,6 +67,29 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+// Always JSON errors for the admin UI (never Express HTML stack pages)
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: `API route not found: ${req.method} ${req.originalUrl}`,
+  });
+});
+
+app.use((err, _req, res, _next) => {
+  console.error("[api]", err);
+  const status = Number(err.status || err.statusCode) || 500;
+  const isJson =
+    err instanceof SyntaxError ||
+    err.type === "entity.parse.failed" ||
+    /JSON|Unexpected token|in JSON/i.test(String(err.message || ""));
+  res.status(isJson ? 400 : status).json({
+    success: false,
+    message: isJson
+      ? "Invalid JSON in request body"
+      : err.message || "Internal server error",
+  });
+});
+
 const PORT = process.env.PORT;
 if (!PORT) {
   console.error("❌ PORT is missing. Set PORT in backend/.env");

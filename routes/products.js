@@ -710,30 +710,80 @@ router.post("/bulk-status", async (req, res) => {
   }
 });
 
-/** Permanently delete many products — removes DB rows, image files, related audits/reviews/wishlist */
+/** Permanently delete many products — one atomic DB remove, then wipe images/related rows */
 router.post("/bulk-delete", async (req, res) => {
   try {
-    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).filter(Boolean) : [];
+    const rawIds = Array.isArray(req.body?.ids) ? req.body.ids : [];
+    const ids = [...new Set(rawIds.map((id) => String(id || "").trim()).filter(Boolean))];
     if (!ids.length) {
       return res.status(400).json({ success: false, message: "Select at least one product to delete" });
     }
 
     const { actor, actorEmail } = actorFrom(req);
-    const products = await Product.find({ _id: { $in: ids } });
+
+    // Snapshot matching products first (for image URLs + audit)
+    const products = await Product.find({ _id: { $in: ids } }).lean();
     if (!products.length) {
       return res.status(404).json({ success: false, message: "No matching products found" });
     }
 
-    const deleted = [];
+    const matchedIds = products.map((p) => String(p._id));
+
+    // Remove ALL selected products from products.json in a single locked write
+    await updateCollection("products", (docs) =>
+      docs.filter((doc) => !matchedIds.some((id) => idsEqual(doc._id, id)))
+    );
+
+    // Cleanup images + related collections (best-effort; products are already gone)
     for (const product of products) {
-      const removed = await purgeProductCompletely(product, { actor, actorEmail, note: "Bulk delete" });
-      deleted.push(removed);
+      const id = String(product._id);
+      for (const img of product.images || []) {
+        if (img?.url) {
+          try {
+            await deleteUploadByUrl(img.url);
+          } catch (fileErr) {
+            console.warn("Bulk delete image warning:", fileErr.message);
+          }
+        }
+      }
+      try {
+        await StoreReview.deleteMany({ productId: id });
+      } catch (_e) {
+        /* ignore */
+      }
+      try {
+        await StoreWishlist.deleteMany({ productId: id });
+      } catch (_e) {
+        /* ignore */
+      }
+      try {
+        await ProductAudit.deleteMany({ productId: id });
+      } catch (_e) {
+        /* ignore */
+      }
+    }
+
+    try {
+      await ProductAudit.create({
+        productId: matchedIds[0],
+        productTitle: `Bulk delete (${matchedIds.length})`,
+        action: "delete",
+        actor,
+        actorEmail,
+        changes: {
+          deletedIds: matchedIds,
+          titles: products.map((p) => p.title),
+        },
+        note: `Bulk deleted ${matchedIds.length} products`,
+      });
+    } catch (auditErr) {
+      console.warn("Bulk delete audit warning:", auditErr.message);
     }
 
     res.json({
       success: true,
-      message: `Deleted ${deleted.length} product${deleted.length === 1 ? "" : "s"} (images & details removed)`,
-      data: { deletedCount: deleted.length, ids: deleted },
+      message: `Deleted ${matchedIds.length} product${matchedIds.length === 1 ? "" : "s"} (images & details removed)`,
+      data: { deletedCount: matchedIds.length, ids: matchedIds },
     });
   } catch (error) {
     console.error("Bulk delete products error:", error);

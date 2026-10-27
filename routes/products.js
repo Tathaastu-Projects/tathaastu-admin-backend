@@ -4,6 +4,8 @@ const multer = require("multer");
 const Product = require("../models/Product");
 const ProductAudit = require("../models/ProductAudit");
 const Remedy = require("../models/Remedy");
+const StoreReview = require("../models/StoreReview");
+const StoreWishlist = require("../models/StoreWishlist");
 const { uploadProductImages } = require("../middleware/upload");
 const { queryCatalog, queryFacets } = require("../lib/storeCatalog");
 const {
@@ -98,6 +100,57 @@ async function writeAudit({ product, action, actor, actorEmail, changes = {}, no
     changes,
     note,
   });
+}
+
+/**
+ * Fully remove a product: image files on disk, DB document, reviews, wishlist rows.
+ * Keeps one final audit trail entry, then clears older audits for that product.
+ */
+async function purgeProductCompletely(product, { actor, actorEmail, note = "Product deleted" } = {}) {
+  const id = String(product._id);
+  const snapshot = {
+    title: product.title,
+    sku: product.sku,
+    images: (product.images || []).map((img) => img?.url).filter(Boolean),
+  };
+
+  for (const url of snapshot.images) {
+    try {
+      await deleteUploadByUrl(url);
+    } catch (fileErr) {
+      console.warn("Product image delete warning:", fileErr.message);
+    }
+  }
+
+  try {
+    await StoreReview.deleteMany({ productId: id });
+  } catch (err) {
+    console.warn("Product review cleanup warning:", err.message);
+  }
+  try {
+    await StoreWishlist.deleteMany({ productId: id });
+  } catch (err) {
+    console.warn("Product wishlist cleanup warning:", err.message);
+  }
+
+  // Clear prior audits, then write a single delete record
+  try {
+    await ProductAudit.deleteMany({ productId: id });
+  } catch (err) {
+    console.warn("Product audit cleanup warning:", err.message);
+  }
+
+  await writeAudit({
+    product,
+    action: "delete",
+    actor,
+    actorEmail,
+    changes: snapshot,
+    note,
+  });
+
+  await product.deleteOne();
+  return id;
 }
 
 function normalizeProductPayload(body = {}) {
@@ -657,6 +710,43 @@ router.post("/bulk-status", async (req, res) => {
   }
 });
 
+/** Permanently delete many products — removes DB rows, image files, related audits/reviews/wishlist */
+router.post("/bulk-delete", async (req, res) => {
+  try {
+    const ids = Array.isArray(req.body?.ids) ? req.body.ids.map(String).filter(Boolean) : [];
+    if (!ids.length) {
+      return res.status(400).json({ success: false, message: "Select at least one product to delete" });
+    }
+
+    const { actor, actorEmail } = actorFrom(req);
+    const products = await Product.find({ _id: { $in: ids } });
+    if (!products.length) {
+      return res.status(404).json({ success: false, message: "No matching products found" });
+    }
+
+    const deleted = [];
+    for (const product of products) {
+      const removed = await purgeProductCompletely(product, { actor, actorEmail, note: "Bulk delete" });
+      deleted.push(removed);
+    }
+
+    res.json({
+      success: true,
+      message: `Deleted ${deleted.length} product${deleted.length === 1 ? "" : "s"} (images & details removed)`,
+      data: { deletedCount: deleted.length, ids: deleted },
+    });
+  } catch (error) {
+    console.error("Bulk delete products error:", error);
+    const busy = error.code === "DB_BUSY" || /busy|lock/i.test(String(error.message || ""));
+    res.status(busy ? 409 : 500).json({
+      success: false,
+      message: busy
+        ? "Another device is saving right now. Wait 2 seconds and try again."
+        : error.message || "Bulk delete failed",
+    });
+  }
+});
+
 /** Stage product images (multi-select) — returns /uploads/products/... URLs for the form */
 router.post("/upload-images", (req, res) => {
   uploadProductImages.array("images", 12)(req, res, async (uploadError) => {
@@ -971,23 +1061,20 @@ router.delete("/:id", async (req, res) => {
     const product = await Product.findById(req.params.id);
     if (!product) return res.status(404).json({ success: false, message: "Product not found" });
     const { actor, actorEmail } = actorFrom(req);
-    await writeAudit({
-      product,
-      action: "delete",
-      actor,
-      actorEmail,
-      changes: { title: product.title, sku: product.sku },
-      note: "Product deleted",
+    await purgeProductCompletely(product, { actor, actorEmail, note: "Product deleted" });
+    res.json({
+      success: true,
+      message: "Product deleted (images & details removed from database)",
     });
-    // Remove product image files from disk + storage mirror
-    for (const img of product.images || []) {
-      if (img?.url) await deleteUploadByUrl(img.url);
-    }
-    await product.deleteOne();
-    res.json({ success: true, message: "Product deleted" });
   } catch (error) {
     console.error("Delete product error:", error);
-    res.status(500).json({ success: false, message: "Failed to delete product" });
+    const busy = error.code === "DB_BUSY" || /busy|lock/i.test(String(error.message || ""));
+    res.status(busy ? 409 : 500).json({
+      success: false,
+      message: busy
+        ? "Another device is saving right now. Wait 2 seconds and try again."
+        : error.message || "Failed to delete product",
+    });
   }
 });
 

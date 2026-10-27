@@ -766,14 +766,38 @@ router.get("/content/home", async (_req, res) => {
       if (hit) intentionProducts[intention] = hit;
     }
 
+    // Match Rashi / zodiac bracelets by title, Hindi/English sign names, or attributes.zodiac
+    // (old filter only checked "rashi|राशि" in title — so the homepage section vanished)
+    const RASHI_RE =
+      /राशि|rashi|mesh|vrishabha|mithun|karka|simha|kanya|tula|vrishchik|dhanu|makar|kumbh|meen|aries|taurus|gemini|cancer|\bleo\b|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces|मेष|वृषभ|मिथुन|कर्क|सिंह|कन्या|तुला|वृश्चिक|धनु|मकर|कुम्भ|मीन/i;
     const rashiProducts = listedProducts
-      .filter((p) => /राशि|rashi/i.test(String(p.title || "")))
-      .slice(0, 24);
+      .filter((p) => {
+        const title = String(p.title || "");
+        const zodiac = String(p.attributes?.zodiac || "");
+        const tags = Array.isArray(p.tags) ? p.tags.join(" ") : String(p.tags || "");
+        const category = String(p.category || "");
+        return (
+          RASHI_RE.test(title) ||
+          RASHI_RE.test(zodiac) ||
+          /rashi|zodiac/i.test(tags) ||
+          /rashi/i.test(category)
+        );
+      })
+      .slice(0, 48);
 
     const latestProducts = listedProducts.slice(0, 20);
     const featured = listedProducts.filter((p) => p.isFeatured).slice(0, 16);
     const bestsellers = listedProducts.filter((p) => p.isBestSeller).slice(0, 16);
     const newArrivals = listedProducts.filter((p) => p.isNewArrival).slice(0, 16);
+
+    let heroTicker = [];
+    try {
+      const { HERO_TICKER_SLUG, parseHeroTicker } = require("../lib/siteHeroTicker");
+      const tickerPage = await StorePage.findOne({ slug: HERO_TICKER_SLUG }).select("content").lean();
+      heroTicker = parseHeroTicker(tickerPage?.content || "").items;
+    } catch (_e) {
+      heroTicker = [];
+    }
 
     const body = {
       success: true,
@@ -783,6 +807,7 @@ router.get("/content/home", async (_req, res) => {
           tagline: "Authentic Rudraksha & Gemstones",
         },
         banners,
+        heroTicker,
         homeSliderManaged: true,
         categoryTiles,
         aboutSection,
@@ -1018,6 +1043,167 @@ router.delete("/admin/logo", async (_req, res) => {
   } catch (error) {
     console.error("Delete logo error:", error);
     res.status(500).json({ success: false, message: "Failed to remove logo" });
+  }
+});
+
+const {
+  SEO_SLUG,
+  SEO_PAGES,
+  parseSeoContent,
+  serializeSeo,
+} = require("../lib/siteSeo");
+
+async function readSiteSeo() {
+  const page = await StorePage.findOne({ slug: SEO_SLUG }).select("content").lean();
+  return parseSeoContent(page?.content || "");
+}
+
+router.get("/admin/seo", async (_req, res) => {
+  try {
+    const seo = await readSiteSeo();
+    res.json({
+      success: true,
+      data: {
+        pages: seo.pages,
+        pageList: SEO_PAGES,
+      },
+    });
+  } catch (error) {
+    console.error("Load SEO error:", error);
+    res.status(500).json({ success: false, message: "Failed to load SEO settings" });
+  }
+});
+
+router.put("/admin/seo", async (req, res) => {
+  try {
+    const incoming = req.body?.pages && typeof req.body.pages === "object" ? req.body.pages : req.body;
+    const content = serializeSeo(incoming || {});
+    await StorePage.findOneAndUpdate(
+      { slug: SEO_SLUG },
+      {
+        $set: {
+          title: "Site SEO",
+          content,
+          isActive: true,
+        },
+        $setOnInsert: { slug: SEO_SLUG },
+      },
+      { upsert: true, new: true }
+    );
+    try {
+      require("../lib/responseCache").invalidatePrefix("store:");
+    } catch (_e) {
+      /* ignore */
+    }
+    const seo = parseSeoContent(content);
+    res.json({
+      success: true,
+      message: "SEO settings saved",
+      data: { pages: seo.pages, pageList: SEO_PAGES },
+    });
+  } catch (error) {
+    console.error("Save SEO error:", error);
+    res.status(500).json({ success: false, message: "Failed to save SEO settings" });
+  }
+});
+
+const {
+  HEADER_BAR_SLUG,
+  parseHeaderBar,
+  serializeHeaderBar,
+  DEFAULT_ITEMS: HEADER_BAR_DEFAULTS,
+} = require("../lib/siteHeaderBar");
+
+async function readHeaderBar() {
+  const page = await StorePage.findOne({ slug: HEADER_BAR_SLUG }).select("content").lean();
+  return parseHeaderBar(page?.content || "");
+}
+
+router.get("/admin/header-bar", async (_req, res) => {
+  try {
+    const data = await readHeaderBar();
+    res.json({ success: true, data: { ...data, defaults: HEADER_BAR_DEFAULTS } });
+  } catch (error) {
+    console.error("Load header bar error:", error);
+    res.status(500).json({ success: false, message: "Failed to load header bar" });
+  }
+});
+
+router.put("/admin/header-bar", async (req, res) => {
+  try {
+    const content = serializeHeaderBar(req.body || {});
+    await StorePage.findOneAndUpdate(
+      { slug: HEADER_BAR_SLUG },
+      {
+        $set: {
+          title: "Top header bar",
+          content,
+          isActive: true,
+        },
+        $setOnInsert: { slug: HEADER_BAR_SLUG },
+      },
+      { upsert: true, new: true }
+    );
+    try {
+      require("../lib/responseCache").invalidatePrefix("store:");
+    } catch (_e) {
+      /* ignore */
+    }
+    const data = parseHeaderBar(content);
+    res.json({ success: true, message: "Top header bar saved", data });
+  } catch (error) {
+    console.error("Save header bar error:", error);
+    res.status(500).json({ success: false, message: "Failed to save header bar" });
+  }
+});
+
+const {
+  HERO_TICKER_SLUG,
+  parseHeroTicker,
+  serializeHeroTicker,
+  DEFAULT_ITEMS: HERO_TICKER_DEFAULTS,
+} = require("../lib/siteHeroTicker");
+
+async function readHeroTicker() {
+  const page = await StorePage.findOne({ slug: HERO_TICKER_SLUG }).select("content").lean();
+  return parseHeroTicker(page?.content || "");
+}
+
+router.get("/admin/hero-ticker", async (_req, res) => {
+  try {
+    const data = await readHeroTicker();
+    res.json({ success: true, data: { ...data, defaults: HERO_TICKER_DEFAULTS } });
+  } catch (error) {
+    console.error("Load hero ticker error:", error);
+    res.status(500).json({ success: false, message: "Failed to load hero ticker" });
+  }
+});
+
+router.put("/admin/hero-ticker", async (req, res) => {
+  try {
+    const content = serializeHeroTicker(req.body || {});
+    await StorePage.findOneAndUpdate(
+      { slug: HERO_TICKER_SLUG },
+      {
+        $set: {
+          title: "Hero ticker",
+          content,
+          isActive: true,
+        },
+        $setOnInsert: { slug: HERO_TICKER_SLUG },
+      },
+      { upsert: true, new: true }
+    );
+    try {
+      require("../lib/responseCache").invalidatePrefix("store:");
+    } catch (_e) {
+      /* ignore */
+    }
+    const data = parseHeroTicker(content);
+    res.json({ success: true, message: "Hero ticker saved", data });
+  } catch (error) {
+    console.error("Save hero ticker error:", error);
+    res.status(500).json({ success: false, message: "Failed to save hero ticker" });
   }
 });
 

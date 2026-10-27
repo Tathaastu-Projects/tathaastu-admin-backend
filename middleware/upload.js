@@ -1,5 +1,6 @@
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const multer = require("multer");
 const { mirrorToStorage } = require("../lib/storedFiles");
 const { ensureStorageLayout } = require("../lib/fileDb/paths");
@@ -7,14 +8,22 @@ const { compressVideoFile, isVideoFile } = require("../lib/compressVideo");
 
 ensureStorageLayout();
 
+function uniqueUploadName(originalname) {
+  const safe = String(originalname || "file")
+    .toLowerCase()
+    .replace(/[^a-z0-9.]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  const rand = crypto.randomBytes(4).toString("hex");
+  return `${Date.now()}-${rand}-${safe || "file"}`;
+}
+
 function diskStorage(rootDir, storageSubdir) {
   return {
     _handleFile(_req, file, cb) {
       fs.mkdirSync(rootDir, { recursive: true });
-      const safe = String(file.originalname || "file")
-        .toLowerCase()
-        .replace(/[^a-z0-9.]+/g, "-");
-      const filename = `${Date.now()}-${safe}`;
+      // Unique name so 3 devices uploading the same filename at once never clash
+      const filename = uniqueUploadName(file.originalname);
       const fullPath = path.join(rootDir, filename);
       const out = fs.createWriteStream(fullPath);
       file.stream.pipe(out);

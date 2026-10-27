@@ -94,6 +94,7 @@ function resolveLinePricing(product, variant) {
  */
 router.get("/meta", async (_req, res) => {
   let logoUrl = "";
+  let seo = { pages: {} };
   try {
     const logo = await StorePage.findOne({ slug: "site-logo" }).select("content").lean();
     const value = logo?.content ? String(logo.content).trim() : "";
@@ -101,10 +102,35 @@ router.get("/meta", async (_req, res) => {
   } catch (_error) {
     logoUrl = "";
   }
+  try {
+    const { SEO_SLUG, parseSeoContent } = require("../lib/siteSeo");
+    const seoPage = await StorePage.findOne({ slug: SEO_SLUG }).select("content").lean();
+    seo = parseSeoContent(seoPage?.content || "");
+  } catch (_error) {
+    try {
+      seo = require("../lib/siteSeo").parseSeoContent("");
+    } catch (_e) {
+      seo = { pages: {} };
+    }
+  }
+  let headerBar = { items: [] };
+  try {
+    const { HEADER_BAR_SLUG, parseHeaderBar } = require("../lib/siteHeaderBar");
+    const barPage = await StorePage.findOne({ slug: HEADER_BAR_SLUG }).select("content").lean();
+    headerBar = parseHeaderBar(barPage?.content || "");
+  } catch (_error) {
+    try {
+      headerBar = require("../lib/siteHeaderBar").parseHeaderBar("");
+    } catch (_e) {
+      headerBar = { items: [] };
+    }
+  }
   res.json({
     success: true,
     data: {
       logoUrl,
+      seo: seo.pages,
+      headerBar: headerBar.items,
       categories: CATEGORIES,
       intentions: INTENTIONS,
       zodiacSigns: ZODIAC_SIGNS,
@@ -152,8 +178,8 @@ router.get("/meta", async (_req, res) => {
         { id: "secure", label: "100% Secure Payments" },
       ],
       support: {
-        email: process.env.STORE_SUPPORT_EMAIL || "support@tathaastu.com",
-        phone: process.env.STORE_SUPPORT_PHONE || "",
+        email: process.env.STORE_SUPPORT_EMAIL || "care@tathasstu.com",
+        phone: process.env.STORE_SUPPORT_PHONE || "+91-9756303737",
       },
     },
   });

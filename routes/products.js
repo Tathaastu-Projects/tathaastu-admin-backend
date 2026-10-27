@@ -6,8 +6,14 @@ const ProductAudit = require("../models/ProductAudit");
 const Remedy = require("../models/Remedy");
 const { uploadProductImages } = require("../middleware/upload");
 const { queryCatalog, queryFacets } = require("../lib/storeCatalog");
-const { buildProductExcelTemplate, parseProductsFromExcel } = require("../lib/productExcel");
+const {
+  buildProductExcelTemplate,
+  parseProductsFromExcel,
+  materializeProductImages,
+} = require("../lib/productExcel");
 const { deleteUploadByUrl } = require("../lib/storedFiles");
+const { updateCollection } = require("../lib/fileDb/collectionStore");
+const { idsEqual, createObjectId } = require("../lib/fileDb/objectId");
 
 const router = express.Router();
 
@@ -227,7 +233,7 @@ router.get("/excel-template", (_req, res) => {
     const buffer = buildProductExcelTemplate();
     res.setHeader(
       "Content-Disposition",
-      'attachment; filename="Tathaastu_Product_Template.xlsx"'
+      'attachment; filename="Abhimantrit_Product_Bulk_Import_Format.xlsx"'
     );
     res.setHeader(
       "Content-Type",
@@ -264,70 +270,128 @@ router.post("/excel-import", (req, res) => {
       }
 
       const { actor, actorEmail } = actorFrom(req);
-      const createdProducts = [];
       const importErrors = [...errors];
 
+      // One read for slug uniqueness (avoids N DB round-trips that made import very slow)
+      const existingProducts = await Product.find({}).select("slug").lean();
+      const usedSlugs = new Set(
+        (existingProducts || []).map((p) => String(p.slug || "").toLowerCase()).filter(Boolean)
+      );
+
+      let remedies = [];
+      try {
+        remedies = await Remedy.find({}).select("_id name slug").lean();
+      } catch (_e) {
+        remedies = [];
+      }
+
+      const toCreate = [];
       for (const item of valid) {
         try {
-          const payload = item.payload;
+          const payload = { ...item.payload };
           let slug = payload.slug || slugify(payload.title);
-          const slugExists = await Product.findOne({ slug });
-          if (slugExists) {
-            slug = `${slug}-${Date.now().toString().slice(-4)}-${Math.floor(Math.random() * 900 + 100)}`;
+          const base = slug;
+          let n = 0;
+          while (usedSlugs.has(String(slug).toLowerCase())) {
+            n += 1;
+            slug = `${base}-${Date.now().toString().slice(-4)}${n}`;
           }
+          usedSlugs.add(String(slug).toLowerCase());
           payload.slug = slug;
 
-          if (payload.linkedRemedyName) {
-            try {
-              const remedy = await Remedy.findOne({
-                $or: [
-                  { name: new RegExp(`^${payload.linkedRemedyName}$`, "i") },
-                  { slug: slugify(payload.linkedRemedyName) },
-                  { name: new RegExp(payload.linkedRemedyName, "i") },
-                ],
-              }).select("_id name");
-              if (remedy) {
-                payload.linkedRemedyId = remedy._id;
-                payload.linkedRemedyName = remedy.name;
-              }
-            } catch (_remErr) {}
+          if (payload.linkedRemedyName && remedies.length) {
+            const want = String(payload.linkedRemedyName).trim().toLowerCase();
+            const remedy = remedies.find(
+              (r) =>
+                String(r.name || "").toLowerCase() === want ||
+                String(r.slug || "").toLowerCase() === slugify(payload.linkedRemedyName) ||
+                String(r.name || "").toLowerCase().includes(want)
+            );
+            if (remedy) {
+              payload.linkedRemedyId = remedy._id;
+              payload.linkedRemedyName = remedy.name;
+            }
           }
 
-          const product = await Product.create({
+          // Keep image URLs as-is — do NOT download remote images during import.
+          // Blocking downloads caused ECONNRESET / 502 "Server is busy" and empty product list.
+          toCreate.push({
             ...payload,
             createdBy: actor,
             updatedBy: actor,
-          });
-
-          try {
-            await writeAudit({
-              product,
-              action: payload.status === "listed" ? "publish" : "create",
-              actor,
-              actorEmail,
-              changes: { row: item.row, title: product.title, sku: product.sku },
-              note: `Imported from file (${req.file?.originalname || "Excel template"})`,
-            });
-          } catch (auditErr) {
-            console.warn("Product audit write warning:", auditErr.message);
-          }
-
-          createdProducts.push({
-            _id: product._id,
-            title: product.title,
-            sku: product.sku,
-            category: product.category,
-            salePrice: product.salePrice,
-            status: product.status,
+            __row: item.row,
           });
         } catch (rowErr) {
           importErrors.push({
             row: item.row,
             title: item.payload?.title || "Unknown",
-            error: rowErr.message || "Database insert error",
+            error: rowErr.message || "Row prepare error",
           });
         }
       }
+
+      if (!toCreate.length) {
+        return res.status(400).json({
+          success: false,
+          message: "No products could be prepared from the file",
+          totalParsed,
+          importedCount: 0,
+          failedCount: importErrors.length,
+          errors: importErrors,
+        });
+      }
+
+      const rowsMeta = toCreate.map((p) => p.__row);
+      const cleanDocs = toCreate.map(({ __row, ...rest }) => rest);
+
+      const created = await Product.create(cleanDocs);
+      const createdList = Array.isArray(created) ? created : [created];
+
+      try {
+        const fileName = req.file?.originalname || "Excel template";
+        await ProductAudit.insertMany(
+          createdList.map((product, idx) => ({
+            productId: product._id,
+            productTitle: product.title,
+            action: product.status === "listed" ? "publish" : "create",
+            actor,
+            actorEmail,
+            changes: { row: rowsMeta[idx], title: product.title, sku: product.sku },
+            note: `Imported from file (${fileName})`,
+          }))
+        );
+      } catch (auditErr) {
+        console.warn("Product audit batch write warning:", auditErr.message);
+      }
+
+      // Background: localize remote image URLs one product at a time (never blocks the HTTP response)
+      setImmediate(async () => {
+        for (const product of createdList) {
+          if (!Array.isArray(product.images) || !product.images.length) continue;
+          const hasRemote = product.images.some((img) =>
+            /^https?:\/\//i.test(String(img?.url || ""))
+          );
+          if (!hasRemote) continue;
+          try {
+            const localImages = await materializeProductImages(product.images, product.title);
+            const changed = localImages.some((img, i) => img.url !== product.images[i]?.url);
+            if (changed) {
+              await Product.findByIdAndUpdate(product._id, { $set: { images: localImages } });
+            }
+          } catch (_e) {
+            /* keep remote URLs */
+          }
+        }
+      });
+
+      const createdProducts = createdList.map((product) => ({
+        _id: product._id,
+        title: product.title,
+        sku: product.sku,
+        category: product.category,
+        salePrice: product.salePrice,
+        status: product.status,
+      }));
 
       res.status(200).json({
         success: true,
@@ -350,42 +414,37 @@ router.post("/excel-import", (req, res) => {
 
 router.get("/stats", async (_req, res) => {
   try {
-    const [total, listed, draft, unlisted, byCategory, lowStockAgg] = await Promise.all([
-      Product.countDocuments(),
-      Product.countDocuments({ status: "listed" }),
-      Product.countDocuments({ status: "draft" }),
-      Product.countDocuments({ status: "unlisted" }),
-      Product.aggregate([{ $group: { _id: "$category", count: { $sum: 1 } } }]),
-      Product.aggregate([
-        {
-          $addFields: {
-            stockTotal: {
-              $cond: [
-                { $gt: [{ $size: { $ifNull: ["$variants", []] } }, 0] },
-                { $sum: "$variants.quantity" },
-                { $ifNull: ["$quantity", 0] },
-              ],
-            },
-            threshold: { $ifNull: ["$lowStockThreshold", 5] },
-          },
-        },
-        { $match: { $expr: { $lte: ["$stockTotal", "$threshold"] } } },
-        { $count: "count" },
-      ]),
-    ]);
-
+    // One collection read → derive all counters (was 6 separate scans before)
+    const all = await Product.find({}).lean();
+    const docs = Array.isArray(all) ? all : [];
+    let listed = 0;
+    let draft = 0;
+    let unlisted = 0;
+    let lowStock = 0;
+    const byCategoryMap = {};
+    for (const p of docs) {
+      if (p.status === "listed") listed += 1;
+      else if (p.status === "draft") draft += 1;
+      else if (p.status === "unlisted") unlisted += 1;
+      const cat = p.category || "other";
+      byCategoryMap[cat] = (byCategoryMap[cat] || 0) + 1;
+      const variants = Array.isArray(p.variants) ? p.variants : [];
+      const stockTotal =
+        variants.length > 0
+          ? variants.reduce((sum, v) => sum + (Number(v?.quantity) || 0), 0)
+          : Number(p.quantity) || 0;
+      const threshold = Number(p.lowStockThreshold) || 5;
+      if (stockTotal <= threshold) lowStock += 1;
+    }
     res.json({
       success: true,
       data: {
-        total,
+        total: docs.length,
         listed,
         draft,
         unlisted,
-        lowStock: lowStockAgg[0]?.count || 0,
-        byCategory: byCategory.reduce((acc, row) => {
-          acc[row._id] = row.count;
-          return acc;
-        }, {}),
+        lowStock,
+        byCategory: byCategoryMap,
       },
     });
   } catch (error) {
@@ -504,8 +563,9 @@ router.get("/", async (req, res) => {
     }
 
     const skip = (pageNum - 1) * limitNum;
+    // lean() avoids wrapping every doc in a Document class — faster list loads
     const [items, total] = await Promise.all([
-      Product.find(filter).sort({ updatedAt: -1 }).skip(skip).limit(limitNum),
+      Product.find(filter).sort({ updatedAt: -1 }).skip(skip).limit(limitNum).lean(),
       Product.countDocuments(filter),
     ]);
 
@@ -723,43 +783,87 @@ router.patch("/:id/status", async (req, res) => {
   }
 });
 
-router.post("/:id/images", uploadProductImages.array("images", 12), async (req, res) => {
-  try {
-    const product = await Product.findById(req.params.id);
-    if (!product) return res.status(404).json({ success: false, message: "Product not found" });
-
-    const files = req.files || [];
-    if (!files.length) {
-      return res.status(400).json({ success: false, message: "No images uploaded" });
+router.post("/:id/images", (req, res) => {
+  uploadProductImages.array("images", 12)(req, res, async (uploadError) => {
+    if (uploadError) {
+      const busy = uploadError.code === "DB_BUSY" || /busy|lock/i.test(String(uploadError.message || ""));
+      return res.status(busy ? 409 : 400).json({
+        success: false,
+        message: busy
+          ? "Another device is saving right now. Wait 2 seconds and upload the photos again."
+          : uploadError.message || "Image upload failed",
+      });
     }
 
-    const { actor, actorEmail } = actorFrom(req);
-    const uploaded = files.map((file, index) => ({
-      url: `/uploads/products/${file.filename}`,
-      alt: product.title,
-      isPrimary: product.images.length === 0 && index === 0,
-    }));
+    try {
+      const files = req.files || [];
+      if (!files.length) {
+        return res.status(400).json({ success: false, message: "No images uploaded" });
+      }
 
-    product.images.push(...uploaded);
-    if (!product.images.some((img) => img.isPrimary) && product.images.length) {
-      product.images[0].isPrimary = true;
+      const { actor, actorEmail } = actorFrom(req);
+      const productId = req.params.id;
+      let updatedProduct = null;
+      let uploadedUrls = [];
+
+      // Atomic append on disk under lock — safe when Admin@… uploads from 3 devices at once
+      await updateCollection("products", (docs) => {
+        const idx = docs.findIndex((d) => idsEqual(d._id, productId));
+        if (idx < 0) return docs;
+
+        const doc = docs[idx];
+        const images = Array.isArray(doc.images) ? [...doc.images] : [];
+        const uploaded = files.map((file, index) => ({
+          _id: createObjectId(),
+          url: `/uploads/products/${file.filename}`,
+          alt: doc.title || "Product image",
+          isPrimary: images.length === 0 && index === 0,
+        }));
+        uploadedUrls = uploaded.map((item) => item.url);
+        images.push(...uploaded);
+        if (images.length && !images.some((img) => img.isPrimary)) {
+          images[0].isPrimary = true;
+        }
+        doc.images = images;
+        doc.updatedBy = actor;
+        doc.updatedAt = new Date().toISOString();
+        docs[idx] = doc;
+        updatedProduct = doc;
+        return docs;
+      });
+
+      if (!updatedProduct) {
+        return res.status(404).json({ success: false, message: "Product not found" });
+      }
+
+      try {
+        await writeAudit({
+          product: updatedProduct,
+          action: "image_upload",
+          actor,
+          actorEmail,
+          changes: { uploaded: uploadedUrls },
+        });
+      } catch (auditErr) {
+        console.warn("Image audit write warning:", auditErr.message);
+      }
+
+      res.json({
+        success: true,
+        data: updatedProduct,
+        message: `${files.length} image${files.length === 1 ? "" : "s"} uploaded`,
+      });
+    } catch (error) {
+      console.error("Image upload error:", error);
+      const busy = error.code === "DB_BUSY" || /busy|lock/i.test(String(error.message || ""));
+      res.status(busy ? 409 : 500).json({
+        success: false,
+        message: busy
+          ? "Another device is saving right now. Wait 2 seconds and upload the photos again."
+          : error.message || "Image upload failed",
+      });
     }
-    product.updatedBy = actor;
-    await product.save();
-
-    await writeAudit({
-      product,
-      action: "image_upload",
-      actor,
-      actorEmail,
-      changes: { uploaded: uploaded.map((item) => item.url) },
-    });
-
-    res.json({ success: true, data: product, message: "Images uploaded" });
-  } catch (error) {
-    console.error("Image upload error:", error);
-    res.status(500).json({ success: false, message: error.message || "Image upload failed" });
-  }
+  });
 });
 
 router.delete("/:id", async (req, res) => {

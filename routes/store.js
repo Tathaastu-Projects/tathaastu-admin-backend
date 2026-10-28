@@ -199,36 +199,36 @@ router.get("/menu", (_req, res) => {
  * Optional: includeFacets=true
  */
 router.get("/catalog", async (req, res) => {
-  const { getCached, setCached } = require("../lib/responseCache");
+  const { getOrCompute } = require("../lib/responseCache");
   const cacheKey = `store:catalog:${JSON.stringify(req.query || {})}`;
-  const cached = getCached(cacheKey);
-  if (cached) {
-    res.set("X-Cache", "HIT");
-    return res.status(cached.status).json(cached.body);
-  }
+  const CATALOG_TTL_MS = 45_000;
 
   try {
-    const result = await queryCatalog(req.query);
-    const payload = {
-      success: true,
-      data: result.items,
-      pagination: result.pagination,
-      priceStats: result.priceStats,
-      appliedFilters: result.params,
-      sortOptions: Object.keys(SORT_OPTIONS).map((value) => ({
-        value,
-        label: value.replace(/_/g, " "),
-      })),
-    };
+    const cached = await getOrCompute(cacheKey, CATALOG_TTL_MS, async () => {
+      const result = await queryCatalog(req.query);
+      const payload = {
+        success: true,
+        data: result.items,
+        pagination: result.pagination,
+        priceStats: result.priceStats,
+        appliedFilters: result.params,
+        sortOptions: Object.keys(SORT_OPTIONS).map((value) => ({
+          value,
+          label: value.replace(/_/g, " "),
+        })),
+      };
 
-    if (result.params.includeFacets) {
-      const facets = await queryFacets(req.query);
-      payload.facets = facets.facets;
-    }
+      if (result.params.includeFacets) {
+        const facets = await queryFacets(req.query);
+        payload.facets = facets.facets;
+      }
 
-    setCached(cacheKey, payload, 8000);
-    res.set("X-Cache", "MISS");
-    res.json(payload);
+      return { status: 200, body: payload };
+    });
+
+    res.set("X-Cache", cached.cache);
+    res.set("Cache-Control", "public, max-age=20, stale-while-revalidate=45");
+    res.status(cached.status).json(cached.body);
   } catch (error) {
     console.error("Store catalog error:", error);
     res.status(500).json({ success: false, message: "Failed to load catalog" });

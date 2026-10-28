@@ -99,6 +99,23 @@ if (!PORT) {
 const server = app.listen(Number(PORT), () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
   console.log("✅ Using local file storage (no MongoDB)");
+
+  // Boot warmup — first shoppers get X-Cache: HIT (same idea as dashboard prefetch)
+  setImmediate(async () => {
+    try {
+      const base = `http://127.0.0.1:${PORT}`;
+      await Promise.all([
+        fetch(`${base}/api/store/content/home`).then((r) => r.arrayBuffer()),
+        fetch(`${base}/api/store/catalog?page=1&limit=24`).then((r) => r.arrayBuffer()),
+        fetch(`${base}/api/store/catalog?page=1&limit=24&includeFacets=true`).then((r) =>
+          r.arrayBuffer()
+        ),
+      ]);
+      console.log("🔥 Store cache warmed (home + catalog)");
+    } catch (err) {
+      console.warn("Store cache warmup skipped:", err.message);
+    }
+  });
 });
 
 // Video upload + ffmpeg compress can take several minutes

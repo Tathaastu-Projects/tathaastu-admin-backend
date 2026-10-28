@@ -687,15 +687,13 @@ router.post("/payments/cancel-unpaid", async (req, res) => {
 /* ------------------------ CMS: banners / blogs / pages ------------------------ */
 
 router.get("/content/home", async (_req, res) => {
-  const { getCached, setCached } = require("../lib/responseCache");
+  const { getOrCompute } = require("../lib/responseCache");
   const cacheKey = "store:content:home";
-  const cached = getCached(cacheKey);
-  if (cached) {
-    res.set("X-Cache", "HIT");
-    return res.status(cached.status).json(cached.body);
-  }
+  // 60s JSON cache — many shoppers share one payload; writes invalidate "store:"
+  const HOME_TTL_MS = 60_000;
 
   try {
+    const result = await getOrCompute(cacheKey, HOME_TTL_MS, async () => {
     const Product = require("../models/Product");
     const { INTENTIONS, ZODIAC_SIGNS, CATEGORIES } = require("../lib/storeCatalog");
 
@@ -856,9 +854,12 @@ router.get("/content/home", async (_req, res) => {
       },
     };
 
-    setCached(cacheKey, body, 10000);
-    res.set("X-Cache", "MISS");
-    res.json(body);
+    return { status: 200, body };
+    });
+
+    res.set("X-Cache", result.cache);
+    res.set("Cache-Control", "public, max-age=30, stale-while-revalidate=60");
+    res.status(result.status).json(result.body);
   } catch (error) {
     console.error("Home content error:", error);
     res.status(500).json({ success: false, message: "Failed to load home content" });

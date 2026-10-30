@@ -2016,19 +2016,24 @@ async function readScreenToSpace() {
       title: String(saved.title || DEFAULT_SCREEN_TO_SPACE.title).trim(),
       subtitle: String(saved.subtitle || "").trim(),
       isActive: saved.isActive !== false,
-      items: items.map((item, idx) => ({
-        id: String(item.id || `reel-${idx + 1}`),
-        overlayTag: String(item.overlayTag || "").trim(),
-        videoUrl: String(item.videoUrl || "").trim(),
-        imageUrl: String(item.imageUrl || "").trim(),
-        productTitle: String(item.productTitle || "").trim(),
-        productPrice: Number(item.productPrice) || 0,
-        productImage: String(item.productImage || "").trim(),
-        productSlug: String(item.productSlug || "").trim(),
-        buttonText: String(item.buttonText || "SHOP NOW").trim(),
-        dotsCount: Number(item.dotsCount) || 4,
-        isActive: item.isActive !== false,
-      })),
+      items: items.map((item, idx) => {
+        const categorySlug = String(item.categorySlug || "")
+          .trim()
+          .replace(/^\/+|\/+$/g, "")
+          .replace(/^shop\//, "");
+        return {
+          id: String(item.id || `reel-${idx + 1}`),
+          overlayTag: String(item.overlayTag || "").trim(),
+          videoUrl: String(item.videoUrl || "").trim(),
+          imageUrl: String(item.imageUrl || "").trim(),
+          categorySlug,
+          categoryLabel: String(item.categoryLabel || "").trim(),
+          categoryHref: categorySlug
+            ? `/shop/${categorySlug}`
+            : String(item.categoryHref || "").trim() || "/shop",
+          isActive: item.isActive !== false,
+        };
+      }),
     };
   } catch (_error) {
     return DEFAULT_SCREEN_TO_SPACE;
@@ -2068,19 +2073,22 @@ router.put("/admin/screen-to-space", async (req, res) => {
     const isActive = payload.isActive !== false;
     const items = Array.isArray(payload.items) ? payload.items : [];
 
-    const cleanItems = items.map((item, idx) => ({
-      id: String(item.id || `reel-${Date.now()}-${idx}`),
-      overlayTag: String(item.overlayTag || "").trim(),
-      videoUrl: String(item.videoUrl || "").trim(),
-      imageUrl: String(item.imageUrl || "").trim(),
-      productTitle: String(item.productTitle || "").trim(),
-      productPrice: Number(item.productPrice) || 0,
-      productImage: String(item.productImage || "").trim(),
-      productSlug: String(item.productSlug || "").trim(),
-      buttonText: String(item.buttonText || "SHOP NOW").trim(),
-      dotsCount: Math.min(Math.max(Number(item.dotsCount) || 4, 1), 8),
-      isActive: item.isActive !== false,
-    }));
+    const cleanItems = items.map((item, idx) => {
+      const categorySlug = String(item.categorySlug || item.categoryHref || "")
+        .trim()
+        .replace(/^\/+|\/+$/g, "")
+        .replace(/^shop\//, "");
+      return {
+        id: String(item.id || `reel-${Date.now()}-${idx}`),
+        overlayTag: String(item.overlayTag || "").trim(),
+        videoUrl: String(item.videoUrl || "").trim(),
+        imageUrl: String(item.imageUrl || "").trim(),
+        categorySlug,
+        categoryLabel: String(item.categoryLabel || "").trim(),
+        categoryHref: categorySlug ? `/shop/${categorySlug}` : "/shop",
+        isActive: item.isActive !== false,
+      };
+    });
 
     const nextData = {
       title,
@@ -2101,7 +2109,6 @@ router.post("/admin/screen-to-space/upload", (req, res) => {
   uploadReelsMedia.fields([
     { name: "video", maxCount: 1 },
     { name: "image", maxCount: 1 },
-    { name: "productImage", maxCount: 1 },
   ])(req, res, async (err) => {
     if (err) {
       return res.status(400).json({ success: false, message: err.message || "Upload failed" });
@@ -2109,14 +2116,12 @@ router.post("/admin/screen-to-space/upload", (req, res) => {
     try {
       const video = req.files?.video?.[0];
       const image = req.files?.image?.[0];
-      const prodImg = req.files?.productImage?.[0];
 
       res.json({
         success: true,
         data: {
           videoUrl: video ? `/uploads/reels/${video.filename}` : undefined,
           imageUrl: image ? `/uploads/reels/${image.filename}` : undefined,
-          productImage: prodImg ? `/uploads/reels/${prodImg.filename}` : undefined,
         },
       });
     } catch (uploadError) {

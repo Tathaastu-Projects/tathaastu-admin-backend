@@ -170,6 +170,7 @@ router.get("/meta", async (_req, res) => {
         "limit",
       ],
       paymentMethods: ["cod", "online"],
+      paymentGateway: process.env.PAYMENT_GATEWAY || "easebuzz",
       currency: "INR",
       trustBadges: [
         { id: "lab", label: "Lab Certified" },

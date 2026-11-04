@@ -15,7 +15,22 @@ app.use(
     crossOriginResourcePolicy: { policy: "cross-origin" },
   }),
 );
-app.use(cors());
+app.use(
+  cors({
+    origin: [
+      "https://abhimantritstore.com",
+      "https://www.abhimantritstore.com",
+      "https://admin.abhimantritstore.com",
+      "http://localhost:3025",
+      "http://localhost:3003",
+      "http://127.0.0.1:3025",
+      "http://127.0.0.1:3003",
+    ],
+    credentials: true,
+    methods: ["GET", "HEAD", "PUT", "PATCH", "POST", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization", "X-Guest-Id", "X-Payment-Token"],
+  }),
+);
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 

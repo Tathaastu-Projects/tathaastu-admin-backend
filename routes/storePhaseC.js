@@ -532,7 +532,6 @@ router.put("/cart", optionalStoreAuth, async (req, res) => {
 
 /* ------------------------ Payments (Easebuzz) ------------------------ */
 
-const rateLimit = require("express-rate-limit");
 const {
   formatAmount,
   getEasebuzzConfig,
@@ -554,15 +553,43 @@ const {
   rateLimitPayment,
 } = require("../lib/paymentSecurity");
 
-const initiatePaymentLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-  // Behind nginx X-Forwarded-For — avoid ValidationError → nginx 502
-  validate: { xForwardedForHeader: false, trustProxy: false },
-  message: { success: false, message: "Too many payment attempts. Please wait a minute." },
-});
+/** Safe fetch to Easebuzz — never throws to Express (avoids nginx 502). */
+async function fetchEasebuzzInitiate(url, body) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
+      },
+      body,
+      signal: controller.signal,
+    });
+    const rawText = await response.text();
+    let data = {};
+    try {
+      data = rawText ? JSON.parse(rawText) : {};
+    } catch (_e) {
+      return {
+        ok: false,
+        httpStatus: response.status,
+        error: "Easebuzz returned an invalid (non-JSON) response",
+        rawText: String(rawText).slice(0, 300),
+      };
+    }
+    return { ok: true, httpStatus: response.status, data };
+  } catch (err) {
+    return {
+      ok: false,
+      httpStatus: 0,
+      error: err instanceof Error ? err.message : "Easebuzz network error",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function storefrontBaseUrl() {
   return String(process.env.STOREFRONT_URL || process.env.FRONTEND_URL || "http://localhost:3025").replace(
@@ -599,9 +626,9 @@ function assertOrderPaymentAccess(req, order) {
  * Creates Easebuzz payment link for an existing store order.
  * Requires paymentToken from order create response.
  */
-router.post("/payments/easebuzz/initiate", initiatePaymentLimiter, async (req, res) => {
+router.post("/payments/easebuzz/initiate", async (req, res) => {
   try {
-    if (!rateLimitPayment(req, res, { key: "easebuzz-initiate", max: 15, windowMs: 60 * 1000 })) {
+    if (!rateLimitPayment(req, res, { key: "easebuzz-initiate", max: 20, windowMs: 60 * 1000 })) {
       return;
     }
 
@@ -643,7 +670,11 @@ router.post("/payments/easebuzz/initiate", initiatePaymentLimiter, async (req, r
       return res.status(400).json({ success: false, message: "Valid order amount required" });
     }
 
-    const firstname = String(order.customer?.name || "Customer").trim().split(/\s+/)[0] || "Customer";
+    const firstname = String(order.customer?.name || "Customer")
+      .trim()
+      .split(/\s+/)[0]
+      .replace(/[^a-zA-Z0-9]/g, "")
+      .slice(0, 60) || "Customer";
     const email = String(order.customer?.email || "").trim().toLowerCase();
     const phone = String(order.customer?.phone || "").replace(/\D/g, "").slice(-10);
     if (!email || phone.length !== 10) {
@@ -653,14 +684,11 @@ router.post("/payments/easebuzz/initiate", initiatePaymentLimiter, async (req, r
       });
     }
 
-    const txnid = String(order.easebuzzTxnId || `ABM${Date.now()}${crypto.randomBytes(3).toString("hex")}`).slice(
-      0,
-      40,
-    );
+    // Always mint a fresh txnid for a new initiate attempt (Easebuzz rejects reuse)
+    const txnid = `ABM${Date.now()}${crypto.randomBytes(3).toString("hex")}`.slice(0, 40);
     const productinfo = `Order ${order.orderNumber}`.slice(0, 100);
     const udf1 = String(order._id);
     const udf2 = String(order.orderNumber || "");
-    // Browser UX only — authoritative PAID comes from /webhook (+ reconcile retrieve API)
     const returnUrl = `${backendPublicUrl(req)}/api/store/payments/easebuzz/return`;
 
     const hash = generateRequestHash({
@@ -689,43 +717,30 @@ router.post("/payments/easebuzz/initiate", initiatePaymentLimiter, async (req, r
     form.set("udf1", udf1);
     form.set("udf2", udf2);
 
-    let response;
-    try {
-      response = await fetch(cfg.initiateUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/x-www-form-urlencoded",
-          Accept: "application/json",
-        },
-        body: form.toString(),
-        ...(typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
-          ? { signal: AbortSignal.timeout(20000) }
-          : {}),
-      });
-    } catch (netErr) {
-      console.error("Easebuzz initiate network error:", netErr);
+    // One retry on transient network failure
+    let ease = await fetchEasebuzzInitiate(cfg.initiateUrl, form.toString());
+    if (!ease.ok && /abort|timeout|network|fetch|ECONN|ENOTFOUND/i.test(String(ease.error || ""))) {
+      ease = await fetchEasebuzzInitiate(cfg.initiateUrl, form.toString());
+    }
+
+    if (!ease.ok) {
+      console.error("Easebuzz initiate network/parse error:", { env: cfg.env, error: ease.error });
       return res.status(502).json({
         success: false,
         message:
-          "Could not reach Easebuzz payment server. Check server network/firewall to pay.easebuzz.in, then retry.",
+          ease.error ||
+          "Could not reach Easebuzz. Please try again in a few seconds.",
         env: cfg.env,
       });
     }
 
-    const rawText = await response.text();
-    let data = {};
-    try {
-      data = rawText ? JSON.parse(rawText) : {};
-    } catch (_e) {
-      console.error("Easebuzz initiate non-JSON:", rawText.slice(0, 300));
-      return res.status(502).json({
-        success: false,
-        message: "Easebuzz returned an invalid response. Please retry in a moment.",
+    const data = ease.data || {};
+    if (Number(data?.status) !== 1 || !data?.data) {
+      console.error("Easebuzz initiate failed:", {
         env: cfg.env,
+        status: data?.status,
+        error: data?.error_desc || data?.data,
       });
-    }
-    if (!response.ok || Number(data?.status) !== 1 || !data?.data) {
-      console.error("Easebuzz initiate failed:", { env: cfg.env, status: data?.status, error: data?.error_desc || data?.data });
       return res.status(400).json({
         success: false,
         message: String(data?.error_desc || data?.data || "Failed to initiate Easebuzz payment"),
@@ -745,7 +760,7 @@ router.post("/payments/easebuzz/initiate", initiatePaymentLimiter, async (req, r
     order.paymentExpiresAt = expiresAt;
     await order.save();
 
-    res.json({
+    return res.json({
       success: true,
       data: {
         paymentUrl,
@@ -760,7 +775,12 @@ router.post("/payments/easebuzz/initiate", initiatePaymentLimiter, async (req, r
     });
   } catch (error) {
     console.error("Easebuzz initiate error:", error);
-    res.status(500).json({ success: false, message: "Payment initiation failed" });
+    if (!res.headersSent) {
+      return res.status(500).json({
+        success: false,
+        message: error instanceof Error ? error.message : "Payment initiation failed",
+      });
+    }
   }
 });
 

@@ -909,10 +909,21 @@ router.post("/admin/payments/reconcile", requireAdminAuth, async (_req, res) => 
  * Cancel an unpaid online order (e.g. user abandons Easebuzz) and restore stock.
  * POST /api/store/payments/cancel-unpaid
  * Requires paymentToken from order create response.
+ * GET = health check only (browser open is GET — real cancel is POST).
  */
+router.get("/payments/cancel-unpaid", (_req, res) => {
+  res.json({
+    success: true,
+    message:
+      "cancel-unpaid is live. Browser GET is only a health check. Checkout must call this with POST + paymentToken.",
+    methodRequired: "POST",
+    path: "/api/store/payments/cancel-unpaid",
+  });
+});
+
 router.post("/payments/cancel-unpaid", async (req, res) => {
   try {
-    if (!rateLimitPayment(req, res, { key: "cancel-unpaid", max: 15, windowMs: 60 * 1000 })) {
+    if (!rateLimitPayment(req, res, { key: "cancel-unpaid", max: 40, windowMs: 60 * 1000 })) {
       return;
     }
 
@@ -959,9 +970,13 @@ router.post("/payments/cancel-unpaid", async (req, res) => {
     }
 
     if (order.stockDecremented) {
-      for (const item of order.items) {
-        // eslint-disable-next-line no-await-in-loop
-        await restoreStock(item.productId, item.variantId, item.quantity);
+      for (const item of order.items || []) {
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          await restoreStock(item.productId, item.variantId, item.quantity);
+        } catch (stockErr) {
+          console.error("Stock restore failed during cancel-unpaid:", stockErr);
+        }
       }
       order.stockDecremented = false;
     }
@@ -970,7 +985,7 @@ router.post("/payments/cancel-unpaid", async (req, res) => {
     order.paymentStatus = "failed";
     await order.save();
 
-    res.json({
+    return res.json({
       success: true,
       message: "Unpaid order cancelled and stock restored",
       data: { orderNumber: order.orderNumber, status: order.status },

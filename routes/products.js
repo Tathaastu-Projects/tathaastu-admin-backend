@@ -155,7 +155,10 @@ async function purgeProductCompletely(product, { actor, actorEmail, note = "Prod
 
 function normalizeProductPayload(body = {}) {
   const title = String(body.title || "").trim();
-  const slug = slugify(body.slug || title);
+  const sku = String(body.sku || "").trim();
+  // Prefer SKU in the public URL (/product/{sku}) when available
+  const slugSource = sku || String(body.slug || "").trim() || title;
+  const slug = slugify(slugSource);
   const intentions = Array.isArray(body.intentions)
     ? body.intentions.filter((item) => INTENTIONS.includes(item))
     : [];
@@ -195,7 +198,7 @@ function normalizeProductPayload(body = {}) {
   return {
     title,
     slug,
-    sku: String(body.sku || "").trim(),
+    sku,
     shortDescription: String(body.shortDescription || "").trim(),
     description: String(body.description || "").trim(),
     category: normalizeCategory(body.category),
@@ -342,7 +345,10 @@ router.post("/excel-import", (req, res) => {
       for (const item of valid) {
         try {
           const payload = { ...item.payload };
-          let slug = payload.slug || slugify(payload.title);
+          let slug =
+            payload.slug ||
+            (payload.sku ? slugify(payload.sku) : "") ||
+            slugify(payload.title);
           const base = slug;
           let n = 0;
           while (usedSlugs.has(String(slug).toLowerCase())) {
@@ -545,7 +551,8 @@ router.get("/public", async (req, res) => {
 
 router.get("/public/:slug", async (req, res) => {
   try {
-    const product = await Product.findOne({ slug: req.params.slug, status: "listed" });
+    const { findListedProductByPath } = require("../lib/findStoreProduct");
+    const product = await findListedProductByPath(req.params.slug);
     if (!product) {
       return res.status(404).json({ success: false, message: "Product not found" });
     }

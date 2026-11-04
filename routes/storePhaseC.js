@@ -21,7 +21,22 @@ const {
   uploadReelsMedia,
   uploadAboutMedia,
   uploadBlogMedia,
+  uploadHeroMedia,
 } = require("../middleware/upload");
+const {
+  HOME_HERO_VIDEO_SLUG,
+  DEFAULT_HOME_HERO_VIDEO,
+  parseHomeHeroVideo,
+  serializeHomeHeroVideo,
+} = require("../lib/siteHomeHeroVideo");
+const {
+  SITE_3D_PRICES_SLUG,
+  DEFAULT_3D_PRODUCTS,
+  parse3dPrices,
+  serialize3dPrices,
+  toOverrideMap,
+  pickProductForSku,
+} = require("../lib/site3dPrices");
 const { execFile } = require("child_process");
 const https = require("https");
 const { deleteStoredFile, deleteUploadByUrl, saveLocalFile } = require("../lib/storedFiles");
@@ -170,11 +185,25 @@ router.get("/auth/orders", requireStoreAuth, async (req, res) => {
 
 /* ------------------------ Reviews ------------------------ */
 
+const { findListedProductByPath } = require("../lib/findStoreProduct");
+
 router.get("/products/:slug/reviews", async (req, res) => {
   try {
     const page = Math.max(Number(req.query.page) || 1, 1);
     const limit = Math.min(Math.max(Number(req.query.limit) || 10, 1), 50);
-    const filter = { productSlug: req.params.slug, status: "approved" };
+    const product = await findListedProductByPath(req.params.slug);
+    const slugKeys = [
+      req.params.slug,
+      product?.slug,
+      product?.sku ? String(product.sku).toLowerCase() : "",
+    ].filter(Boolean);
+    const filter = {
+      status: "approved",
+      $or: [
+        { productSlug: { $in: [...new Set(slugKeys)] } },
+        ...(product?._id ? [{ productId: String(product._id) }] : []),
+      ],
+    };
     const [items, total] = await Promise.all([
       StoreReview.find(filter)
         .sort({ createdAt: -1 })
@@ -194,7 +223,7 @@ router.get("/products/:slug/reviews", async (req, res) => {
 
 router.post("/products/:slug/reviews", optionalStoreAuth, async (req, res) => {
   try {
-    const product = await Product.findOne({ slug: req.params.slug, status: "listed" });
+    const product = await findListedProductByPath(req.params.slug);
     if (!product) return res.status(404).json({ success: false, message: "Product not found" });
 
     const rating = Number(req.body?.rating);
@@ -501,129 +530,334 @@ router.put("/cart", optionalStoreAuth, async (req, res) => {
   }
 });
 
-/* ------------------------ Payments (Razorpay) ------------------------ */
+/* ------------------------ Payments (Easebuzz) ------------------------ */
 
-router.post("/payments/razorpay/create-order", async (req, res) => {
+const rateLimit = require("express-rate-limit");
+const {
+  formatAmount,
+  getEasebuzzConfig,
+  generateRequestHash,
+} = require("../lib/easebuzz");
+const {
+  syncStoreOrderPayment,
+  reconcilePendingEasebuzzOrders,
+} = require("../lib/easebuzzReconcile");
+const {
+  paymentExpiresAtFromNow,
+  processEasebuzzWebhook,
+  processEasebuzzBrowserReturn,
+} = require("../lib/easebuzzPayments");
+const { requireAdminAuth } = require("../middleware/adminAuth");
+const {
+  verifyOrderPaymentToken,
+  phonesMatch,
+  rateLimitPayment,
+} = require("../lib/paymentSecurity");
+
+const initiatePaymentLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 12,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: "Too many payment attempts. Please wait a minute." },
+});
+
+function storefrontBaseUrl() {
+  return String(process.env.STOREFRONT_URL || process.env.FRONTEND_URL || "http://localhost:3025").replace(
+    /\/$/,
+    "",
+  );
+}
+
+function backendPublicUrl(req) {
+  const fromEnv = String(process.env.BACKEND_PUBLIC_URL || process.env.API_PUBLIC_URL || "").replace(/\/$/, "");
+  if (fromEnv) return fromEnv;
+  const proto = req.get("x-forwarded-proto") || req.protocol || "http";
+  const host = req.get("x-forwarded-host") || req.get("host");
+  return `${proto}://${host}`;
+}
+
+function assertOrderPaymentAccess(req, order) {
+  const paymentToken = String(req.body?.paymentToken || req.headers["x-payment-token"] || "").trim();
+  const phone = String(req.body?.phone || "").trim();
+  if (!paymentToken) {
+    return { ok: false, status: 401, message: "Payment token required" };
+  }
+  if (!verifyOrderPaymentToken(paymentToken, order._id, order.customer?.phone)) {
+    return { ok: false, status: 403, message: "Invalid or expired payment token" };
+  }
+  if (phone && !phonesMatch(phone, order.customer?.phone)) {
+    return { ok: false, status: 403, message: "Phone does not match this order" };
+  }
+  return { ok: true };
+}
+
+/**
+ * POST /api/store/payments/easebuzz/initiate
+ * Creates Easebuzz payment link for an existing store order.
+ * Requires paymentToken from order create response.
+ */
+router.post("/payments/easebuzz/initiate", initiatePaymentLimiter, async (req, res) => {
   try {
-    const amountRupees = Number(req.body?.amount);
-    const receipt = String(req.body?.receipt || `TST-${Date.now()}`);
-    if (!amountRupees || amountRupees < 1) {
-      return res.status(400).json({ success: false, message: "Valid amount required" });
+    if (!rateLimitPayment(req, res, { key: "easebuzz-initiate", max: 15, windowMs: 60 * 1000 })) {
+      return;
     }
 
-    const keyId = process.env.RAZORPAY_KEY_ID || "";
-    const keySecret = process.env.RAZORPAY_KEY_SECRET || "";
-    const amountPaise = Math.round(amountRupees * 100);
+    const storeOrderId = req.body?.storeOrderId;
+    if (!storeOrderId || !Types.ObjectId.isValid(storeOrderId)) {
+      return res.status(400).json({ success: false, message: "Valid storeOrderId required" });
+    }
 
-    if (!keyId || !keySecret) {
-      // Dev fallback so storefront can be wired before keys are configured
-      return res.json({
-        success: true,
-        data: {
-          id: `order_dev_${Date.now()}`,
-          amount: amountPaise,
-          currency: "INR",
-          receipt,
-          status: "created",
-          keyId: keyId || "rzp_test_dev",
-          mode: "mock",
-        },
-        message: "Razorpay keys missing — mock order returned for development",
+    const order = await StoreOrder.findById(storeOrderId);
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    const access = assertOrderPaymentAccess(req, order);
+    if (!access.ok) {
+      return res.status(access.status).json({ success: false, message: access.message });
+    }
+
+    if (order.paymentMethod !== "online") {
+      return res.status(400).json({ success: false, message: "Order is not an online payment order" });
+    }
+    if (order.paymentStatus === "paid") {
+      return res.status(400).json({ success: false, message: "Order already paid" });
+    }
+    if (order.status === "cancelled" || order.paymentStatus === "expired") {
+      return res.status(400).json({ success: false, message: "Order is cancelled or expired" });
+    }
+
+    const cfg = getEasebuzzConfig();
+    if (!cfg.configured) {
+      return res.status(500).json({
+        success: false,
+        message: "Easebuzz keys missing. Set EASEBUZZ_MERCHANT_KEY and EASEBUZZ_SALT in backend .env",
       });
     }
 
-    const auth = Buffer.from(`${keyId}:${keySecret}`).toString("base64");
-    const response = await fetch("https://api.razorpay.com/v1/orders", {
+    const amount = formatAmount(order.pricing?.total);
+    if (Number(amount) < 1) {
+      return res.status(400).json({ success: false, message: "Valid order amount required" });
+    }
+
+    const firstname = String(order.customer?.name || "Customer").trim().split(/\s+/)[0] || "Customer";
+    const email = String(order.customer?.email || "").trim().toLowerCase();
+    const phone = String(order.customer?.phone || "").replace(/\D/g, "").slice(-10);
+    if (!email || phone.length !== 10) {
+      return res.status(400).json({
+        success: false,
+        message: "Customer email and 10-digit phone are required for online payment",
+      });
+    }
+
+    const txnid = String(order.easebuzzTxnId || `ABM${Date.now()}${crypto.randomBytes(3).toString("hex")}`).slice(
+      0,
+      40,
+    );
+    const productinfo = `Order ${order.orderNumber}`.slice(0, 100);
+    const udf1 = String(order._id);
+    const udf2 = String(order.orderNumber || "");
+    // Browser UX only — authoritative PAID comes from /webhook (+ reconcile retrieve API)
+    const returnUrl = `${backendPublicUrl(req)}/api/store/payments/easebuzz/return`;
+
+    const hash = generateRequestHash({
+      key: cfg.key,
+      txnid,
+      amount,
+      productinfo,
+      firstname,
+      email,
+      udf1,
+      udf2,
+      salt: cfg.salt,
+    });
+
+    const form = new URLSearchParams();
+    form.set("key", cfg.key);
+    form.set("txnid", txnid);
+    form.set("amount", amount);
+    form.set("productinfo", productinfo);
+    form.set("firstname", firstname);
+    form.set("email", email);
+    form.set("phone", phone);
+    form.set("surl", returnUrl);
+    form.set("furl", returnUrl);
+    form.set("hash", hash);
+    form.set("udf1", udf1);
+    form.set("udf2", udf2);
+
+    const response = await fetch(cfg.initiateUrl, {
       method: "POST",
       headers: {
-        Authorization: `Basic ${auth}`,
-        "Content-Type": "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+        Accept: "application/json",
       },
-      body: JSON.stringify({
-        amount: amountPaise,
-        currency: "INR",
-        receipt,
-        payment_capture: 1,
-        notes: req.body?.notes || {},
-      }),
+      body: form.toString(),
     });
-    const data = await response.json();
-    if (!response.ok) {
-      return res.status(response.status).json({
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || Number(data?.status) !== 1 || !data?.data) {
+      console.error("Easebuzz initiate failed:", data);
+      return res.status(400).json({
         success: false,
-        message: data?.error?.description || "Failed to create Razorpay order",
+        message: data?.error_desc || data?.data || "Failed to initiate Easebuzz payment",
         data,
       });
     }
 
+    const accessKey = String(data.data);
+    const paymentUrl = cfg.payUrl(accessKey);
+    const initiatedAt = new Date().toISOString();
+    const expiresAt = paymentExpiresAtFromNow();
+
+    order.easebuzzTxnId = txnid;
+    order.easebuzzAccessKey = accessKey;
+    order.easebuzzStatus = "initiated";
+    order.paymentInitiatedAt = initiatedAt;
+    order.paymentExpiresAt = expiresAt;
+    await order.save();
+
     res.json({
       success: true,
       data: {
-        id: data.id,
-        amount: data.amount,
-        currency: data.currency,
-        receipt: data.receipt,
-        status: data.status,
-        keyId,
-        mode: "live",
+        paymentUrl,
+        accessKey,
+        txnid,
+        amount,
+        env: cfg.env,
+        orderNumber: order.orderNumber,
+        storeOrderId: String(order._id),
+        paymentExpiresAt: expiresAt,
       },
     });
   } catch (error) {
-    console.error("Razorpay create error:", error);
-    res.status(500).json({ success: false, message: "Payment order failed" });
-  }
-});
-
-router.post("/payments/razorpay/verify", async (req, res) => {
-  try {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature, storeOrderId } = req.body || {};
-    if (!razorpay_order_id || !razorpay_payment_id || !razorpay_signature) {
-      return res.status(400).json({ success: false, message: "Missing Razorpay payment fields" });
-    }
-
-    const keySecret = process.env.RAZORPAY_KEY_SECRET || "";
-    let valid = false;
-
-    if (!keySecret && String(razorpay_order_id).startsWith("order_dev_")) {
-      valid = true;
-    } else if (keySecret) {
-      const expected = crypto
-        .createHmac("sha256", keySecret)
-        .update(`${razorpay_order_id}|${razorpay_payment_id}`)
-        .digest("hex");
-      valid = expected === razorpay_signature;
-    }
-
-    if (!valid) {
-      return res.status(400).json({ success: false, message: "Invalid payment signature" });
-    }
-
-    if (storeOrderId && Types.ObjectId.isValid(storeOrderId)) {
-      await StoreOrder.findByIdAndUpdate(storeOrderId, {
-        paymentMethod: "online",
-        paymentStatus: "paid",
-        status: "confirmed",
-        razorpayOrderId: razorpay_order_id,
-        razorpayPaymentId: razorpay_payment_id,
-      });
-    }
-
-    res.json({
-      success: true,
-      message: "Payment verified",
-      data: { razorpay_order_id, razorpay_payment_id },
-    });
-  } catch (error) {
-    res.status(500).json({ success: false, message: "Payment verification failed" });
+    console.error("Easebuzz initiate error:", error);
+    res.status(500).json({ success: false, message: "Payment initiation failed" });
   }
 });
 
 /**
- * Cancel an unpaid online order (e.g. Razorpay modal dismissed) and restore stock.
+ * S2S Transaction Webhook — sole primary authority to mark PAID.
+ * Register this URL in Easebuzz dashboard → Transaction Webhook.
+ * POST /api/store/payments/easebuzz/webhook
+ */
+router.post("/payments/easebuzz/webhook", async (req, res) => {
+  try {
+    if (!rateLimitPayment(req, res, { key: "easebuzz-webhook", max: 120, windowMs: 60 * 1000, silent: true })) {
+      return res.status(429).send("Too many requests");
+    }
+    const payload = { ...(req.body || {}) };
+    const result = await processEasebuzzWebhook(payload);
+    if (!result.ok && result.action === "rejected") {
+      return res.status(400).send(result.message || "rejected");
+    }
+    return res.status(result.httpStatus || 200).send("OK");
+  } catch (error) {
+    console.error("Easebuzz webhook error:", error);
+    return res.status(500).send("error");
+  }
+});
+
+/**
+ * Browser SURL/FURL return — UX only.
+ * Confirms via Easebuzz Transaction API (not browser payload alone), then redirects.
+ */
+async function handleEasebuzzReturn(req, res) {
+  const front = storefrontBaseUrl();
+  try {
+    if (!rateLimitPayment(req, res, { key: "easebuzz-return", max: 60, windowMs: 60 * 1000, silent: true })) {
+      return res.redirect(`${front}/order/failed?reason=${encodeURIComponent("Too many requests")}`);
+    }
+    const payload = { ...(req.query || {}), ...(req.body || {}) };
+    const result = await processEasebuzzBrowserReturn(payload);
+    return res.redirect(`${front}${result.redirectPath}`);
+  } catch (error) {
+    console.error("Easebuzz return error:", error);
+    return res.redirect(`${front}/order/failed?reason=${encodeURIComponent("Payment verification failed")}`);
+  }
+}
+
+router.post("/payments/easebuzz/return", handleEasebuzzReturn);
+router.get("/payments/easebuzz/return", handleEasebuzzReturn);
+
+/** @deprecated Keep old callback path as alias to return (backward compatible). */
+router.post("/payments/easebuzz/callback", handleEasebuzzReturn);
+router.get("/payments/easebuzz/callback", handleEasebuzzReturn);
+
+/**
+ * Manually sync one order with Easebuzz (network/callback miss recovery).
+ * POST /api/store/payments/easebuzz/sync  { storeOrderId, paymentToken, phone? }
+ */
+router.post("/payments/easebuzz/sync", async (req, res) => {
+  try {
+    if (!rateLimitPayment(req, res, { key: "easebuzz-sync", max: 10, windowMs: 60 * 1000 })) {
+      return;
+    }
+    const storeOrderId = req.body?.storeOrderId || req.body?.orderId;
+    if (!storeOrderId || !Types.ObjectId.isValid(storeOrderId)) {
+      return res.status(400).json({ success: false, message: "storeOrderId required" });
+    }
+    const order = await StoreOrder.findById(storeOrderId);
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    const access = assertOrderPaymentAccess(req, order);
+    if (!access.ok) {
+      return res.status(access.status).json({ success: false, message: access.message });
+    }
+    const result = await syncStoreOrderPayment(order);
+    if (result.action === "missing") {
+      return res.status(404).json({ success: false, message: result.message });
+    }
+    res.json({
+      success: true,
+      message: result.message,
+      data: {
+        action: result.action,
+        orderNumber: result.order?.orderNumber,
+        paymentStatus: result.order?.paymentStatus,
+        status: result.order?.status,
+        easebuzzTxnId: result.order?.easebuzzTxnId,
+        easebuzzPaymentId: result.order?.easebuzzPaymentId,
+        easebuzzStatus: result.order?.easebuzzStatus,
+      },
+    });
+  } catch (error) {
+    console.error("Easebuzz sync error:", error);
+    res.status(500).json({ success: false, message: "Payment sync failed" });
+  }
+});
+
+/**
+ * Batch reconcile pending online payments.
+ * POST /api/store/admin/payments/reconcile
+ */
+router.post("/admin/payments/reconcile", requireAdminAuth, async (_req, res) => {
+  try {
+    const summary = await reconcilePendingEasebuzzOrders({ minAgeMs: 0 });
+    res.json({
+      success: true,
+      message: `Checked ${summary.checked} pending payment(s)`,
+      data: summary,
+    });
+  } catch (error) {
+    console.error("Easebuzz reconcile error:", error);
+    res.status(500).json({ success: false, message: "Payment reconcile failed" });
+  }
+});
+
+/**
+ * Cancel an unpaid online order (e.g. user abandons Easebuzz) and restore stock.
  * POST /api/store/payments/cancel-unpaid
+ * Requires paymentToken from order create response.
  */
 router.post("/payments/cancel-unpaid", async (req, res) => {
   try {
+    if (!rateLimitPayment(req, res, { key: "cancel-unpaid", max: 15, windowMs: 60 * 1000 })) {
+      return;
+    }
+
     const storeOrderId = req.body?.storeOrderId;
     let order = null;
 
@@ -633,6 +867,11 @@ router.post("/payments/cancel-unpaid", async (req, res) => {
 
     if (!order) {
       return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    const access = assertOrderPaymentAccess(req, order);
+    if (!access.ok) {
+      return res.status(access.status).json({ success: false, message: access.message });
     }
 
     if (order.paymentMethod !== "online") {
@@ -717,6 +956,8 @@ router.get("/content/home", async (_req, res) => {
       featuredFinds,
       screenToSpace,
       testimonials,
+      homeHeroVideo,
+      rashiLogos,
     ] = await Promise.all([
       StoreBanner.find({ isActive: true }).sort({ sortOrder: 1, createdAt: -1 }),
       StoreBlogPost.find({ status: "published" }).sort({ publishedAt: -1 }).limit(6),
@@ -727,6 +968,8 @@ router.get("/content/home", async (_req, res) => {
       readFeaturedFinds(),
       readScreenToSpace(),
       readTestimonials(),
+      readHomeHeroVideo(),
+      readRashiLogos(),
     ]);
 
     const countMap = {};
@@ -806,6 +1049,7 @@ router.get("/content/home", async (_req, res) => {
         },
         banners,
         heroTicker,
+        homeHeroVideo,
         homeSliderManaged: true,
         categoryTiles,
         aboutSection,
@@ -827,6 +1071,7 @@ router.get("/content/home", async (_req, res) => {
         })),
         intentionProducts,
         rashiProducts,
+        rashiLogos,
         latestProducts,
         categories: categoryCards,
         zodiacSigns: ZODIAC_SIGNS.map((sign) => ({
@@ -1159,6 +1404,174 @@ router.put("/admin/header-bar", async (req, res) => {
 });
 
 const {
+  VIDEO_SPEED_SLUG,
+  PRESETS: VIDEO_SPEED_PRESETS,
+  parseVideoSpeed,
+  serializeVideoSpeed,
+} = require("../lib/siteVideoSpeed");
+
+const {
+  RASHI_LOGOS_SLUG,
+  signById: rashiSignById,
+  parseRashiLogos,
+  serializeRashiLogos,
+} = require("../lib/siteRashiLogos");
+
+async function readVideoSpeed() {
+  const page = await StorePage.findOne({ slug: VIDEO_SPEED_SLUG }).select("content").lean();
+  return parseVideoSpeed(page?.content || "");
+}
+
+async function readRashiLogos() {
+  const page = await StorePage.findOne({ slug: RASHI_LOGOS_SLUG }).select("content").lean();
+  return parseRashiLogos(page?.content || "");
+}
+
+async function writeRashiLogos(items) {
+  const content = serializeRashiLogos(items);
+  await StorePage.findOneAndUpdate(
+    { slug: RASHI_LOGOS_SLUG },
+    {
+      $set: {
+        title: "Rashi bracelet logos",
+        content,
+        isActive: true,
+      },
+      $setOnInsert: { slug: RASHI_LOGOS_SLUG },
+    },
+    { upsert: true }
+  );
+}
+
+router.get("/admin/video-speed", async (_req, res) => {
+  try {
+    const data = await readVideoSpeed();
+    res.json({
+      success: true,
+      data: {
+        ...data,
+        presets: Object.values(VIDEO_SPEED_PRESETS),
+      },
+    });
+  } catch (error) {
+    console.error("Load video speed error:", error);
+    res.status(500).json({ success: false, message: "Failed to load video speed" });
+  }
+});
+
+router.put("/admin/video-speed", async (req, res) => {
+  try {
+    const content = serializeVideoSpeed(req.body || {});
+    await StorePage.findOneAndUpdate(
+      { slug: VIDEO_SPEED_SLUG },
+      {
+        $set: {
+          title: "Storefront video speed",
+          content,
+          isActive: true,
+        },
+        $setOnInsert: { slug: VIDEO_SPEED_SLUG },
+      },
+      { upsert: true, new: true }
+    );
+    try {
+      require("../lib/responseCache").invalidatePrefix("store:");
+    } catch (_e) {
+      /* ignore */
+    }
+    const data = parseVideoSpeed(content);
+    res.json({ success: true, message: "Video speed saved", data });
+  } catch (error) {
+    console.error("Save video speed error:", error);
+    res.status(500).json({ success: false, message: "Failed to save video speed" });
+  }
+});
+
+router.get("/admin/rashi-logos", async (_req, res) => {
+  try {
+    const data = await readRashiLogos();
+    res.json({ success: true, data });
+  } catch (error) {
+    console.error("Load rashi logos error:", error);
+    res.status(500).json({ success: false, message: "Failed to load rashi logos" });
+  }
+});
+
+router.put("/admin/rashi-logos/:id", (req, res) => {
+  uploadBannerImage.single("logo")(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      const base = rashiSignById(req.params.id);
+      if (!base) {
+        if (req.file) removeBannerFile(`/uploads/banners/${req.file.filename}`);
+        return res.status(404).json({ success: false, message: "Rashi sign not found" });
+      }
+      const items = await readRashiLogos();
+      const current = items.find((item) => item.id === base.id);
+      let logo = current?.logo || "";
+      if (req.file) {
+        const nextLogo = `/uploads/banners/${req.file.filename}`;
+        if (logo && logo !== nextLogo && String(logo).startsWith("/uploads/banners/")) {
+          removeBannerFile(logo);
+        }
+        logo = nextLogo;
+      } else {
+        const pasted = String(req.body?.logo || "").trim();
+        if (pasted) {
+          if (logo && logo !== pasted && String(logo).startsWith("/uploads/banners/")) {
+            removeBannerFile(logo);
+          }
+          logo = pasted;
+        }
+      }
+      if (!logo && !req.file) {
+        return res.status(400).json({ success: false, message: "Upload a logo image" });
+      }
+      const next = items.map((item) => (item.id === base.id ? { ...item, logo } : item));
+      await writeRashiLogos(next);
+      try {
+        require("../lib/responseCache").invalidatePrefix("store:");
+      } catch (_e) {
+        /* ignore */
+      }
+      const saved = (await readRashiLogos()).find((item) => item.id === base.id);
+      res.json({ success: true, message: "Rashi logo updated", data: saved });
+    } catch (error) {
+      console.error("Update rashi logo error:", error);
+      res.status(500).json({ success: false, message: "Failed to update rashi logo" });
+    }
+  });
+});
+
+router.delete("/admin/rashi-logos/:id/logo", async (req, res) => {
+  try {
+    const base = rashiSignById(req.params.id);
+    if (!base) {
+      return res.status(404).json({ success: false, message: "Rashi sign not found" });
+    }
+    const items = await readRashiLogos();
+    const current = items.find((item) => item.id === base.id);
+    if (current?.logo && String(current.logo).startsWith("/uploads/banners/")) {
+      removeBannerFile(current.logo);
+    }
+    const next = items.map((item) => (item.id === base.id ? { ...item, logo: "" } : item));
+    await writeRashiLogos(next);
+    try {
+      require("../lib/responseCache").invalidatePrefix("store:");
+    } catch (_e) {
+      /* ignore */
+    }
+    const saved = (await readRashiLogos()).find((item) => item.id === base.id);
+    res.json({ success: true, message: "Rashi logo cleared", data: saved });
+  } catch (error) {
+    console.error("Delete rashi logo error:", error);
+    res.status(500).json({ success: false, message: "Failed to clear rashi logo" });
+  }
+});
+
+const {
   HERO_TICKER_SLUG,
   parseHeroTicker,
   serializeHeroTicker,
@@ -1205,6 +1618,264 @@ router.put("/admin/hero-ticker", async (req, res) => {
   } catch (error) {
     console.error("Save hero ticker error:", error);
     res.status(500).json({ success: false, message: "Failed to save hero ticker" });
+  }
+});
+
+/* ------------------------ 3D explorer product prices ------------------------ */
+
+async function read3dPrices() {
+  const page = await StorePage.findOne({ slug: SITE_3D_PRICES_SLUG }).select("content").lean();
+  return parse3dPrices(page?.content || "");
+}
+
+router.get("/admin/3d-prices", async (_req, res) => {
+  try {
+    const data = await read3dPrices();
+    res.json({
+      success: true,
+      data: { ...data, defaults: DEFAULT_3D_PRODUCTS },
+    });
+  } catch (error) {
+    console.error("Load 3D prices error:", error);
+    res.status(500).json({ success: false, message: "Failed to load 3D prices" });
+  }
+});
+
+router.put("/admin/3d-prices", async (req, res) => {
+  try {
+    const content = serialize3dPrices(req.body || {});
+    await StorePage.findOneAndUpdate(
+      { slug: SITE_3D_PRICES_SLUG },
+      {
+        $set: {
+          title: "3D explorer prices",
+          content,
+          isActive: true,
+        },
+        $setOnInsert: { slug: SITE_3D_PRICES_SLUG },
+      },
+      { upsert: true, new: true }
+    );
+    try {
+      require("../lib/responseCache").invalidatePrefix("store:");
+    } catch (_e) {
+      /* ignore */
+    }
+    const data = parse3dPrices(content);
+    res.json({ success: true, message: "3D prices saved", data });
+  } catch (error) {
+    console.error("Save 3D prices error:", error);
+    res.status(500).json({ success: false, message: "Failed to save 3D prices" });
+  }
+});
+
+async function resolve3dSlugBySku(products) {
+  const skus = [
+    ...new Set(
+      (products || [])
+        .map((p) => String(p.sku || "").trim())
+        .filter((sku) => sku && !sku.includes("/") && sku.length < 120)
+    ),
+  ];
+  const slugBySku = {};
+  if (!skus.length) return slugBySku;
+
+  const Product = require("../models/Product");
+  const rows = await Product.find({
+    $or: [
+      { sku: { $in: skus } },
+      { slug: { $in: skus } },
+    ],
+  })
+    .select("sku slug status updatedAt")
+    .lean();
+
+  const bySku = new Map();
+  const bySlug = new Map();
+  for (const row of rows) {
+    const sku = String(row.sku || "").trim();
+    const slug = String(row.slug || "").trim();
+    if (sku) {
+      if (!bySku.has(sku)) bySku.set(sku, []);
+      bySku.get(sku).push(row);
+    }
+    if (slug) bySlug.set(slug, row);
+  }
+
+  for (const sku of skus) {
+    if (bySlug.has(sku)) {
+      slugBySku[sku] = bySlug.get(sku).slug;
+      slugBySku[sku.toLowerCase()] = bySlug.get(sku).slug;
+      continue;
+    }
+    const picked = pickProductForSku(bySku.get(sku) || []);
+    if (picked?.slug) {
+      slugBySku[sku] = picked.slug;
+      slugBySku[sku.toLowerCase()] = picked.slug;
+    }
+  }
+  return slugBySku;
+}
+
+/** Public map for the homepage 3D iframe */
+router.get("/3d-prices", async (_req, res) => {
+  try {
+    const data = await read3dPrices();
+    const slugBySku = await resolve3dSlugBySku(data.products);
+    res.set("Cache-Control", "public, max-age=30");
+    res.json({
+      success: true,
+      data: { byId: toOverrideMap(data, slugBySku) },
+    });
+  } catch (error) {
+    console.error("Public 3D prices error:", error);
+    res.status(500).json({ success: false, message: "Failed to load 3D prices" });
+  }
+});
+
+/* ------------------------ Full-screen home hero video ------------------------ */
+
+function removeHeroFile(fileUrl) {
+  if (!fileUrl || !String(fileUrl).startsWith("/uploads/")) return;
+  deleteUploadByUrl(fileUrl).catch(() => {});
+}
+
+async function readHomeHeroVideo() {
+  const page = await StorePage.findOne({ slug: HOME_HERO_VIDEO_SLUG }).select("content").lean();
+  return parseHomeHeroVideo(page?.content || "");
+}
+
+async function writeHomeHeroVideo(section) {
+  const content = serializeHomeHeroVideo(section);
+  await StorePage.findOneAndUpdate(
+    { slug: HOME_HERO_VIDEO_SLUG },
+    {
+      $set: {
+        title: "Home hero video",
+        content,
+        isActive: true,
+      },
+      $setOnInsert: { slug: HOME_HERO_VIDEO_SLUG },
+    },
+    { upsert: true }
+  );
+  return parseHomeHeroVideo(content);
+}
+
+router.get("/admin/home-hero-video", async (_req, res) => {
+  try {
+    res.json({
+      success: true,
+      data: { ...(await readHomeHeroVideo()), defaults: DEFAULT_HOME_HERO_VIDEO },
+    });
+  } catch (error) {
+    console.error("Load home hero video error:", error);
+    res.status(500).json({ success: false, message: "Failed to load hero video" });
+  }
+});
+
+router.put("/admin/home-hero-video", (req, res) => {
+  uploadHeroMedia.fields([
+    { name: "video", maxCount: 1 },
+    { name: "poster", maxCount: 1 },
+  ])(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      const current = await readHomeHeroVideo();
+      const video = req.files?.video?.[0];
+      const poster = req.files?.poster?.[0];
+      let videoUrl = current.videoUrl;
+      let posterUrl = current.posterUrl;
+
+      if (video) {
+        const next = `/uploads/hero/${video.filename}`;
+        if (videoUrl && videoUrl !== next) removeHeroFile(videoUrl);
+        videoUrl = next;
+      } else if (req.body?.videoUrl !== undefined) {
+        const customVideo = String(req.body.videoUrl).trim();
+        if (videoUrl && videoUrl !== customVideo && videoUrl.startsWith("/uploads/hero/")) {
+          removeHeroFile(videoUrl);
+        }
+        videoUrl = customVideo;
+      }
+
+      if (poster) {
+        const next = `/uploads/hero/${poster.filename}`;
+        if (posterUrl && posterUrl !== next) removeHeroFile(posterUrl);
+        posterUrl = next;
+      } else if (req.body?.posterUrl !== undefined) {
+        const customPoster = String(req.body.posterUrl).trim();
+        if (posterUrl && posterUrl !== customPoster && posterUrl.startsWith("/uploads/hero/")) {
+          removeHeroFile(posterUrl);
+        }
+        posterUrl = customPoster;
+      }
+
+      const enabledRaw = req.body?.enabled;
+      const enabled =
+        enabledRaw === false || enabledRaw === "false" || enabledRaw === "0" || enabledRaw === 0
+          ? false
+          : true;
+
+      const section = await writeHomeHeroVideo({
+        enabled,
+        videoUrl,
+        posterUrl,
+        headline: req.body?.headline,
+        subheadline: req.body?.subheadline,
+        ctaLabel: req.body?.ctaLabel,
+        ctaHref: req.body?.ctaHref,
+      });
+
+      try {
+        require("../lib/responseCache").invalidatePrefix("store:");
+      } catch (_e) {
+        /* ignore */
+      }
+
+      res.json({ success: true, data: section, message: "Hero video saved" });
+    } catch (error) {
+      console.error("Update home hero video error:", error);
+      res.status(500).json({ success: false, message: "Failed to save hero video" });
+    }
+  });
+});
+
+router.delete("/admin/home-hero-video/video", async (_req, res) => {
+  try {
+    const current = await readHomeHeroVideo();
+    if (current.videoUrl) removeHeroFile(current.videoUrl);
+    current.videoUrl = "";
+    const section = await writeHomeHeroVideo(current);
+    try {
+      require("../lib/responseCache").invalidatePrefix("store:");
+    } catch (_e) {
+      /* ignore */
+    }
+    res.json({ success: true, data: section, message: "Hero video removed" });
+  } catch (error) {
+    console.error("Delete home hero video error:", error);
+    res.status(500).json({ success: false, message: "Failed to remove hero video" });
+  }
+});
+
+router.delete("/admin/home-hero-video/poster", async (_req, res) => {
+  try {
+    const current = await readHomeHeroVideo();
+    if (current.posterUrl) removeHeroFile(current.posterUrl);
+    current.posterUrl = "";
+    const section = await writeHomeHeroVideo(current);
+    try {
+      require("../lib/responseCache").invalidatePrefix("store:");
+    } catch (_e) {
+      /* ignore */
+    }
+    res.json({ success: true, data: section, message: "Poster removed" });
+  } catch (error) {
+    console.error("Delete home hero poster error:", error);
+    res.status(500).json({ success: false, message: "Failed to remove poster" });
   }
 });
 

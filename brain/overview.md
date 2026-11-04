@@ -32,7 +32,7 @@ uploads/                # Primary media served at /uploads/*
 ## Env essentials
 
 `PORT`, `JWT_SECRET`, `NODE_ENV`  
-Optional: `RAZORPAY_*`, `STORE_*`, `MS_GRAPH_*`, `ADMIN_NOTIFICATION_EMAILS`
+Optional: `EASEBUZZ_*`, `STOREFRONT_URL`, `STORE_*`, `MS_GRAPH_*`, `ADMIN_NOTIFICATION_EMAILS`
 
 ## Seed
 

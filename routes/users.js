@@ -63,8 +63,9 @@ function mapOrder(order) {
       shipping: Number(pricing.shipping || 0),
       total: Number(pricing.total || 0),
     },
-    razorpayOrderId: order.razorpayOrderId || "",
-    razorpayPaymentId: order.razorpayPaymentId || "",
+    easebuzzTxnId: order.easebuzzTxnId || "",
+    easebuzzPaymentId: order.easebuzzPaymentId || "",
+    easebuzzStatus: order.easebuzzStatus || "",
     createdAt: order.createdAt || null,
     updatedAt: order.updatedAt || null,
   };

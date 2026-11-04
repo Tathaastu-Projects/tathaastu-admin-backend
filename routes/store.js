@@ -19,6 +19,7 @@ const {
 } = require("../lib/storeCatalog");
 const { decrementStock, restoreStock } = require("../lib/storeStock");
 const { optionalStoreAuth } = require("../middleware/storeAuth");
+const { requireAdminAuth } = require("../middleware/adminAuth");
 const StoreCart = require("../models/StoreCart");
 
 const router = express.Router();
@@ -125,12 +126,25 @@ router.get("/meta", async (_req, res) => {
       headerBar = { items: [] };
     }
   }
+  let videoSpeed = { preset: "normal", rate: 1 };
+  try {
+    const { VIDEO_SPEED_SLUG, parseVideoSpeed } = require("../lib/siteVideoSpeed");
+    const speedPage = await StorePage.findOne({ slug: VIDEO_SPEED_SLUG }).select("content").lean();
+    videoSpeed = parseVideoSpeed(speedPage?.content || "");
+  } catch (_error) {
+    try {
+      videoSpeed = require("../lib/siteVideoSpeed").parseVideoSpeed("");
+    } catch (_e) {
+      videoSpeed = { preset: "normal", rate: 1 };
+    }
+  }
   res.json({
     success: true,
     data: {
       logoUrl,
       seo: seo.pages,
       headerBar: headerBar.items,
+      videoSpeed,
       categories: CATEGORIES,
       intentions: INTENTIONS,
       zodiacSigns: ZODIAC_SIGNS,
@@ -324,12 +338,15 @@ router.get("/collections/:slug", async (req, res) => {
   }
 });
 
+const { findListedProductByPath } = require("../lib/findStoreProduct");
+
 /**
  * GET /api/store/products/:slug
+ * :slug may be the URL slug or the catalog SKU
  */
 router.get("/products/:slug", async (req, res) => {
   try {
-    const product = await Product.findOne({ slug: req.params.slug, status: "listed" });
+    const product = await findListedProductByPath(req.params.slug);
     if (!product) {
       return res.status(404).json({ success: false, message: "Product not found" });
     }
@@ -344,7 +361,7 @@ router.get("/products/:slug", async (req, res) => {
  */
 router.get("/products/:slug/related", async (req, res) => {
   try {
-    const product = await Product.findOne({ slug: req.params.slug, status: "listed" });
+    const product = await findListedProductByPath(req.params.slug);
     if (!product) {
       return res.status(404).json({ success: false, message: "Product not found" });
     }
@@ -527,7 +544,8 @@ router.post("/orders", optionalStoreAuth, async (req, res) => {
     }
 
     const subtotal = validatedItems.reduce((sum, item) => sum + item.lineTotal, 0);
-    const shipping = Number(body.shippingFee) > 0 ? Number(body.shippingFee) : 0;
+    // Never trust client-supplied shipping/discount amounts for payment totals.
+    const shipping = 0;
 
     let discount = 0;
     let couponCode = "";
@@ -585,6 +603,19 @@ router.post("/orders", optionalStoreAuth, async (req, res) => {
       }
     }
 
+    const { createOrderPaymentToken } = require("../lib/paymentSecurity");
+    const { paymentExpiresAtFromNow } = require("../lib/easebuzzPayments");
+    const paymentToken =
+      paymentMethod === "online"
+        ? createOrderPaymentToken(order._id, phone)
+        : undefined;
+
+    if (paymentMethod === "online") {
+      order.paymentExpiresAt = paymentExpiresAtFromNow();
+      order.paymentInitiatedAt = order.createdAt || new Date().toISOString();
+      await order.save();
+    }
+
     res.status(201).json({
       success: true,
       data: {
@@ -593,6 +624,8 @@ router.post("/orders", optionalStoreAuth, async (req, res) => {
         status: order.status,
         paymentMethod: order.paymentMethod,
         paymentStatus: order.paymentStatus,
+        paymentToken,
+        paymentExpiresAt: order.paymentExpiresAt || undefined,
         pricing: order.pricing,
         items: order.items,
         customer: order.customer,
@@ -649,6 +682,9 @@ router.get("/orders/:orderNumber", async (req, res) => {
         status: order.status,
         paymentMethod: order.paymentMethod,
         paymentStatus: order.paymentStatus,
+        easebuzzTxnId: order.easebuzzTxnId || "",
+        easebuzzPaymentId: order.easebuzzPaymentId || "",
+        easebuzzStatus: order.easebuzzStatus || "",
         pricing: order.pricing,
         items: order.items,
         shippingAddress: order.shippingAddress,
@@ -671,7 +707,7 @@ router.get("/orders/:orderNumber", async (req, res) => {
  * GET /api/store/admin/orders
  * Admin list of store orders (for future admin UI).
  */
-router.get("/admin/orders", async (req, res) => {
+router.get("/admin/orders", requireAdminAuth, async (req, res) => {
   try {
     const { status, q, page = 1, limit = 30 } = req.query;
     const filter = {};
@@ -716,7 +752,7 @@ router.get("/admin/orders", async (req, res) => {
 /**
  * GET /api/store/admin/orders/:id
  */
-router.get("/admin/orders/:id", async (req, res) => {
+router.get("/admin/orders/:id", requireAdminAuth, async (req, res) => {
   try {
     const order = await StoreOrder.findById(req.params.id);
     if (!order) {
@@ -729,9 +765,32 @@ router.get("/admin/orders/:id", async (req, res) => {
 });
 
 /**
+ * POST /api/store/admin/orders/:id/sync-payment
+ * Pull latest Easebuzz status into this order (for missed callbacks / network issues).
+ */
+router.post("/admin/orders/:id/sync-payment", requireAdminAuth, async (req, res) => {
+  try {
+    const { syncStoreOrderPayment } = require("../lib/easebuzzReconcile");
+    const result = await syncStoreOrderPayment(req.params.id);
+    if (result.action === "missing") {
+      return res.status(404).json({ success: false, message: result.message });
+    }
+    res.json({
+      success: true,
+      message: result.message,
+      data: result.order,
+      action: result.action,
+    });
+  } catch (error) {
+    console.error("Admin sync payment error:", error);
+    res.status(500).json({ success: false, message: "Failed to sync payment status" });
+  }
+});
+
+/**
  * PATCH /api/store/admin/orders/:id/status
  */
-router.patch("/admin/orders/:id/status", async (req, res) => {
+router.patch("/admin/orders/:id/status", requireAdminAuth, async (req, res) => {
   try {
     const status = String(req.body?.status || "");
     if (!ORDER_STATUSES.includes(status)) {
@@ -839,7 +898,7 @@ router.post("/leads/consultation", async (req, res) => {
 /**
  * GET /api/store/admin/leads
  */
-router.get("/admin/leads", async (req, res) => {
+router.get("/admin/leads", requireAdminAuth, async (req, res) => {
   try {
     const { type, status, page = 1, limit = 30 } = req.query;
     const filter = {};

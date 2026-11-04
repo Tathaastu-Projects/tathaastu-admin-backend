@@ -2,12 +2,19 @@ const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 const express = require("express");
 const cors = require("cors");
+const helmet = require("helmet");
 const { ensureStorageLayout, STORAGE_ROOT, DATA_DIR } = require("./lib/fileDb");
 
 ensureStorageLayout();
 
 const app = express();
 
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  }),
+);
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
@@ -116,6 +123,13 @@ const server = app.listen(Number(PORT), () => {
       console.warn("Store cache warmup skipped:", err.message);
     }
   });
+
+  try {
+    const { startEasebuzzReconcileScheduler } = require("./lib/easebuzzReconcile");
+    startEasebuzzReconcileScheduler();
+  } catch (err) {
+    console.warn("Easebuzz reconcile scheduler not started:", err.message);
+  }
 });
 
 // Video upload + ffmpeg compress can take several minutes

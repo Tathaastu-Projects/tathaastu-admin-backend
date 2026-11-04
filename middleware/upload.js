@@ -156,6 +156,16 @@ const uploadBlogMedia = multer({
   limits: { fileSize: VIDEO_UPLOAD_MAX, files: 20 },
 });
 
+const heroRoot = path.join(__dirname, "..", "uploads", "hero");
+fs.mkdirSync(heroRoot, { recursive: true });
+const heroStorage = diskStorage(heroRoot, "hero");
+
+const uploadHeroMedia = multer({
+  storage: heroStorage,
+  fileFilter: featuredFileFilter,
+  limits: { fileSize: VIDEO_UPLOAD_MAX, files: 2 },
+});
+
 module.exports = {
   uploadProductImages,
   uploadBannerImage,
@@ -164,10 +174,12 @@ module.exports = {
   uploadReelsMedia,
   uploadAboutMedia,
   uploadBlogMedia,
+  uploadHeroMedia,
   uploadRoot,
   bannerRoot,
   featuredRoot,
   reelsRoot,
   aboutRoot,
   blogsRoot,
+  heroRoot,
 };

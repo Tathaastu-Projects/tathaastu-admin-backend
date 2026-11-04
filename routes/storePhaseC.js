@@ -741,7 +741,18 @@ router.post("/payments/easebuzz/initiate", initiatePaymentLimiter, async (req, r
  * S2S Transaction Webhook — sole primary authority to mark PAID.
  * Register this URL in Easebuzz dashboard → Transaction Webhook.
  * POST /api/store/payments/easebuzz/webhook
+ *
+ * GET = health check only (browser open). Easebuzz always sends POST.
  */
+router.get("/payments/easebuzz/webhook", (_req, res) => {
+  res.json({
+    success: true,
+    message: "Easebuzz webhook is live. Easebuzz must call this URL with POST (browser GET is only a health check).",
+    methodRequired: "POST",
+    path: "/api/store/payments/easebuzz/webhook",
+  });
+});
+
 router.post("/payments/easebuzz/webhook", async (req, res) => {
   try {
     if (!rateLimitPayment(req, res, { key: "easebuzz-webhook", max: 120, windowMs: 60 * 1000, silent: true })) {

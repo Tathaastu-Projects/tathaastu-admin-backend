@@ -9,6 +9,9 @@ ensureStorageLayout();
 
 const app = express();
 
+// Required behind nginx / reverse proxy (otherwise express-rate-limit can 502)
+app.set("trust proxy", 1);
+
 app.use(
   helmet({
     contentSecurityPolicy: false,

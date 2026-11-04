@@ -556,9 +556,11 @@ const {
 
 const initiatePaymentLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 12,
+  max: 30,
   standardHeaders: true,
   legacyHeaders: false,
+  // Behind nginx X-Forwarded-For — avoid ValidationError → nginx 502
+  validate: { xForwardedForHeader: false, trustProxy: false },
   message: { success: false, message: "Too many payment attempts. Please wait a minute." },
 });
 
@@ -687,22 +689,47 @@ router.post("/payments/easebuzz/initiate", initiatePaymentLimiter, async (req, r
     form.set("udf1", udf1);
     form.set("udf2", udf2);
 
-    const response = await fetch(cfg.initiateUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-      },
-      body: form.toString(),
-    });
+    let response;
+    try {
+      response = await fetch(cfg.initiateUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+          Accept: "application/json",
+        },
+        body: form.toString(),
+        ...(typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+          ? { signal: AbortSignal.timeout(20000) }
+          : {}),
+      });
+    } catch (netErr) {
+      console.error("Easebuzz initiate network error:", netErr);
+      return res.status(502).json({
+        success: false,
+        message:
+          "Could not reach Easebuzz payment server. Check server network/firewall to pay.easebuzz.in, then retry.",
+        env: cfg.env,
+      });
+    }
 
-    const data = await response.json().catch(() => ({}));
+    const rawText = await response.text();
+    let data = {};
+    try {
+      data = rawText ? JSON.parse(rawText) : {};
+    } catch (_e) {
+      console.error("Easebuzz initiate non-JSON:", rawText.slice(0, 300));
+      return res.status(502).json({
+        success: false,
+        message: "Easebuzz returned an invalid response. Please retry in a moment.",
+        env: cfg.env,
+      });
+    }
     if (!response.ok || Number(data?.status) !== 1 || !data?.data) {
-      console.error("Easebuzz initiate failed:", data);
+      console.error("Easebuzz initiate failed:", { env: cfg.env, status: data?.status, error: data?.error_desc || data?.data });
       return res.status(400).json({
         success: false,
-        message: data?.error_desc || data?.data || "Failed to initiate Easebuzz payment",
-        data,
+        message: String(data?.error_desc || data?.data || "Failed to initiate Easebuzz payment"),
+        env: cfg.env,
       });
     }
 

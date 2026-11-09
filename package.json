@@ -14,7 +14,9 @@
     "enrich:figma": "node scripts/enrichCatalogForFigma.js",
     "extract:pdfs": "node scripts/extractPdfs.js",
     "test:pay": "node scripts/test-easebuzz-twice.js",
-    "test:pay:live": "node scripts/test-easebuzz-twice.js https://storebackend.abhimantritstore.com"
+    "test:pay:live": "node scripts/test-easebuzz-twice.js https://storebackend.abhimantritstore.com",
+    "test:pay:local": "node scripts/test-easebuzz-twice.js http://127.0.0.1:3024",
+    "diag:pay": "node scripts/diag-initiate-crash.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

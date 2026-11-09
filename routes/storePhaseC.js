@@ -686,21 +686,14 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
     form.set("udf1", udf1);
     form.set("udf2", udf2);
 
-    // Persist txnid before outbound call so logs/reconcile still see the attempt
-    const initiatedAt = new Date().toISOString();
-    const expiresAt = paymentExpiresAtFromNow();
-    order.easebuzzTxnId = txnid;
-    order.easebuzzStatus = "initiating";
-    order.paymentInitiatedAt = initiatedAt;
-    order.paymentExpiresAt = expiresAt;
-    await order.save();
-    console.log("[easebuzz-initiate] saved txnid, calling Easebuzz", {
+    console.log("[easebuzz-initiate] calling Easebuzz", {
       orderNumber: order.orderNumber,
       txnid,
       env: cfg.env,
+      memMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
     });
 
-    // One retry on transient network failure
+    // One retry on transient network failure (in-process https — no child spawn)
     let ease = await fetchEasebuzzInitiate(cfg.initiateUrl, form.toString());
     if (!ease.ok && /abort|timeout|network|fetch|ECONN|ENOTFOUND/i.test(String(ease.error || ""))) {
       console.warn("[easebuzz-initiate] retry after network error:", ease.error);
@@ -722,6 +715,7 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
       orderNumber: order.orderNumber,
       httpStatus: ease.httpStatus,
       status: ease.data?.status,
+      memMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
     });
 
     const data = ease.data || {};
@@ -740,11 +734,24 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
 
     const accessKey = String(data.data);
     const paymentUrl = cfg.payUrl(accessKey);
+    const initiatedAt = new Date().toISOString();
+    const expiresAt = paymentExpiresAtFromNow();
 
-    order.easebuzzAccessKey = accessKey;
-    order.easebuzzStatus = "initiated";
-    await order.save();
-    console.log("[easebuzz-initiate] OK", { orderNumber: order.orderNumber, txnid });
+    // Single write after success (avoid double full-file save before HTTPS)
+    await StoreOrder.findByIdAndUpdate(String(order._id), {
+      $set: {
+        easebuzzTxnId: txnid,
+        easebuzzAccessKey: accessKey,
+        easebuzzStatus: "initiated",
+        paymentInitiatedAt: initiatedAt,
+        paymentExpiresAt: expiresAt,
+      },
+    });
+    console.log("[easebuzz-initiate] OK", {
+      orderNumber: order.orderNumber,
+      txnid,
+      memMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    });
 
     return res.json({
       success: true,
@@ -808,6 +815,10 @@ router.get("/payments/easebuzz/ping", async (_req, res) => {
       env: cfg.env,
       initiateUrl: cfg.initiateUrl,
       ms: Date.now() - started,
+      node: process.version,
+      pid: process.pid,
+      memMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      isolated: String(process.env.EASEBUZZ_HTTP_ISOLATED || "false"),
       easebuzzReachable: Boolean(probe && (probe.ok || probe.httpStatus || probe.error)),
       probe: {
         ok: Boolean(probe?.ok),

@@ -73,16 +73,28 @@ async function once(n) {
 
   await health(`before-init-${n}`);
   const t0 = Date.now();
-  const ir = await fetch(`${base}/api/store/payments/easebuzz/initiate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      storeOrderId: oj.data.id,
-      paymentToken: oj.data.paymentToken,
-      phone: "7500620049",
-    }),
-  });
-  const raw = await ir.text();
+  let ir;
+  let raw = "";
+  try {
+    ir = await fetch(`${base}/api/store/payments/easebuzz/initiate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        storeOrderId: oj.data.id,
+        paymentToken: oj.data.paymentToken,
+        phone: "7500620049",
+      }),
+    });
+    raw = await ir.text();
+  } catch (err) {
+    const ms = Date.now() - t0;
+    console.log(`  INIT CRASH ms=${ms} ${err instanceof Error ? err.message : err}`);
+    await health(`after-init-${n}`);
+    console.log("  >> MAIN ERROR: Node closed the socket mid-initiate (process crash).");
+    console.log("  >> Run: pm2 logs mantrit_store_backend --lines 80");
+    console.log("  >> Then: npm run diag:pay   AND   node scripts/purge-pending-online-orders.js");
+    return false;
+  }
   const ms = Date.now() - t0;
   const ct = ir.headers.get("content-type") || "";
   console.log(`  INIT ${ir.status} ms=${ms} ct=${ct}`);

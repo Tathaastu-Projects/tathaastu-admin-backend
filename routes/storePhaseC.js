@@ -690,6 +690,7 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
       orderNumber: order.orderNumber,
       txnid,
       env: cfg.env,
+      transport: process.env.EASEBUZZ_HTTP_TRANSPORT || (process.platform === "win32" ? "https" : "curl"),
       memMB: Math.round(process.memoryUsage().rss / 1024 / 1024),
     });
 

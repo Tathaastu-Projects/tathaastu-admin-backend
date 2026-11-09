@@ -555,9 +555,9 @@ const {
 
 const { postFormUrlEncoded } = require("../lib/easebuzzHttp");
 
-/** Safe Easebuzz initiate — child-process isolated so TLS crashes cannot kill API. */
+/** Easebuzz initiate via Node https (no undici fetch, no child spawn by default). */
 async function fetchEasebuzzInitiate(url, body) {
-  return postFormUrlEncoded(url, body, { timeoutMs: 20000, isolated: true });
+  return postFormUrlEncoded(url, body, { timeoutMs: 20000, isolated: false });
 }
 
 function storefrontBaseUrl() {
@@ -686,9 +686,24 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
     form.set("udf1", udf1);
     form.set("udf2", udf2);
 
+    // Persist txnid before outbound call so logs/reconcile still see the attempt
+    const initiatedAt = new Date().toISOString();
+    const expiresAt = paymentExpiresAtFromNow();
+    order.easebuzzTxnId = txnid;
+    order.easebuzzStatus = "initiating";
+    order.paymentInitiatedAt = initiatedAt;
+    order.paymentExpiresAt = expiresAt;
+    await order.save();
+    console.log("[easebuzz-initiate] saved txnid, calling Easebuzz", {
+      orderNumber: order.orderNumber,
+      txnid,
+      env: cfg.env,
+    });
+
     // One retry on transient network failure
     let ease = await fetchEasebuzzInitiate(cfg.initiateUrl, form.toString());
     if (!ease.ok && /abort|timeout|network|fetch|ECONN|ENOTFOUND/i.test(String(ease.error || ""))) {
+      console.warn("[easebuzz-initiate] retry after network error:", ease.error);
       ease = await fetchEasebuzzInitiate(cfg.initiateUrl, form.toString());
     }
 
@@ -702,6 +717,12 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
         env: cfg.env,
       });
     }
+
+    console.log("[easebuzz-initiate] Easebuzz responded", {
+      orderNumber: order.orderNumber,
+      httpStatus: ease.httpStatus,
+      status: ease.data?.status,
+    });
 
     const data = ease.data || {};
     if (Number(data?.status) !== 1 || !data?.data) {
@@ -719,15 +740,11 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
 
     const accessKey = String(data.data);
     const paymentUrl = cfg.payUrl(accessKey);
-    const initiatedAt = new Date().toISOString();
-    const expiresAt = paymentExpiresAtFromNow();
 
-    order.easebuzzTxnId = txnid;
     order.easebuzzAccessKey = accessKey;
     order.easebuzzStatus = "initiated";
-    order.paymentInitiatedAt = initiatedAt;
-    order.paymentExpiresAt = expiresAt;
     await order.save();
+    console.log("[easebuzz-initiate] OK", { orderNumber: order.orderNumber, txnid });
 
     return res.json({
       success: true,
@@ -784,7 +801,7 @@ router.get("/payments/easebuzz/ping", async (_req, res) => {
     const probe = await postFormUrlEncoded(
       cfg.initiateUrl,
       "key=probe&txnid=ping&amount=1.00&productinfo=ping&firstname=Ping&email=ping@example.com&phone=9999999999&surl=https://example.com&furl=https://example.com&hash=0",
-      { timeoutMs: 15000, isolated: true },
+      { timeoutMs: 15000, isolated: false },
     );
     return res.json({
       success: true,

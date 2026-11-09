@@ -12,7 +12,9 @@
     "import:gemsmantra": "node scripts/importGemsmantraProducts.js",
     "import:gemsmantra:collections": "node scripts/importGemsmantraCollections.js",
     "enrich:figma": "node scripts/enrichCatalogForFigma.js",
-    "extract:pdfs": "node scripts/extractPdfs.js"
+    "extract:pdfs": "node scripts/extractPdfs.js",
+    "test:pay": "node scripts/test-easebuzz-twice.js",
+    "test:pay:live": "node scripts/test-easebuzz-twice.js https://storebackend.abhimantritstore.com"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

@@ -121,6 +121,14 @@ if (!PORT) {
   process.exit(1);
 }
 
+// Keep API alive if a library throws outside Express — never silently exit.
+process.on("uncaughtException", (err) => {
+  console.error("[fatal] uncaughtException:", err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[fatal] unhandledRejection:", reason);
+});
+
 const server = app.listen(Number(PORT), () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
   console.log("✅ Using local file storage (no MongoDB)");

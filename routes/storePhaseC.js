@@ -553,42 +553,11 @@ const {
   rateLimitPayment,
 } = require("../lib/paymentSecurity");
 
-/** Safe fetch to Easebuzz — never throws to Express (avoids nginx 502). */
+const { postFormUrlEncoded } = require("../lib/easebuzzHttp");
+
+/** Safe Easebuzz initiate — child-process isolated so TLS crashes cannot kill API. */
 async function fetchEasebuzzInitiate(url, body) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 20000);
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-        Accept: "application/json",
-      },
-      body,
-      signal: controller.signal,
-    });
-    const rawText = await response.text();
-    let data = {};
-    try {
-      data = rawText ? JSON.parse(rawText) : {};
-    } catch (_e) {
-      return {
-        ok: false,
-        httpStatus: response.status,
-        error: "Easebuzz returned an invalid (non-JSON) response",
-        rawText: String(rawText).slice(0, 300),
-      };
-    }
-    return { ok: true, httpStatus: response.status, data };
-  } catch (err) {
-    return {
-      ok: false,
-      httpStatus: 0,
-      error: err instanceof Error ? err.message : "Easebuzz network error",
-    };
-  } finally {
-    clearTimeout(timer);
-  }
+  return postFormUrlEncoded(url, body, { timeoutMs: 20000, isolated: true });
 }
 
 function storefrontBaseUrl() {
@@ -798,6 +767,47 @@ router.get("/payments/easebuzz/webhook", (_req, res) => {
     methodRequired: "POST",
     path: "/api/store/payments/easebuzz/webhook",
   });
+});
+
+/**
+ * GET /api/store/payments/easebuzz/ping
+ * Diagnoses outbound HTTPS to Easebuzz without creating an order.
+ * If this returns JSON while initiate used to nginx-502, isolation is working.
+ */
+router.get("/payments/easebuzz/ping", async (_req, res) => {
+  try {
+    const cfg = getEasebuzzConfig();
+    if (!cfg.configured) {
+      return res.status(500).json({ success: false, message: "Easebuzz keys missing", env: cfg.env });
+    }
+    const started = Date.now();
+    const probe = await postFormUrlEncoded(
+      cfg.initiateUrl,
+      "key=probe&txnid=ping&amount=1.00&productinfo=ping&firstname=Ping&email=ping@example.com&phone=9999999999&surl=https://example.com&furl=https://example.com&hash=0",
+      { timeoutMs: 15000, isolated: true },
+    );
+    return res.json({
+      success: true,
+      env: cfg.env,
+      initiateUrl: cfg.initiateUrl,
+      ms: Date.now() - started,
+      easebuzzReachable: Boolean(probe && (probe.ok || probe.httpStatus || probe.error)),
+      probe: {
+        ok: Boolean(probe?.ok),
+        httpStatus: probe?.httpStatus || 0,
+        error: probe?.error || null,
+        dataPreview: probe?.ok
+          ? String(probe?.data?.error_desc || probe?.data?.data || probe?.data?.status || "").slice(0, 160)
+          : String(probe?.rawText || "").slice(0, 160),
+      },
+    });
+  } catch (error) {
+    console.error("Easebuzz ping error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error instanceof Error ? error.message : "Easebuzz ping failed",
+    });
+  }
 });
 
 router.post("/payments/easebuzz/webhook", async (req, res) => {

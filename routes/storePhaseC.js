@@ -1905,6 +1905,21 @@ router.put("/admin/home-hero-video", (req, res) => {
         const next = `/uploads/hero/${video.filename}`;
         if (videoUrl && videoUrl !== next) removeHeroFile(videoUrl);
         videoUrl = next;
+        // Auto poster if admin didn't upload one — instant first paint on storefront
+        if (!poster && !String(req.body?.posterUrl || "").trim()) {
+          try {
+            const { extractVideoPoster } = require("../lib/compressVideo");
+            const videoAbs = path.join(__dirname, "..", "uploads", "hero", video.filename);
+            const posterAbs = await extractVideoPoster(videoAbs);
+            if (posterAbs) {
+              const posterName = path.basename(posterAbs);
+              if (posterUrl && posterUrl.startsWith("/uploads/hero/")) removeHeroFile(posterUrl);
+              posterUrl = `/uploads/hero/${posterName}`;
+            }
+          } catch (posterErr) {
+            console.warn("Hero poster auto-extract skipped:", posterErr.message);
+          }
+        }
       } else if (req.body?.videoUrl !== undefined) {
         const customVideo = String(req.body.videoUrl).trim();
         if (videoUrl && videoUrl !== customVideo && videoUrl.startsWith("/uploads/hero/")) {

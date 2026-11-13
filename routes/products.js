@@ -248,6 +248,16 @@ function normalizeProductPayload(body = {}) {
           .filter((item) => item.label)
           .slice(0, 8)
       : [],
+    // Product-page FAQs only — empty list means hide FAQ block on storefront
+    faqs: Array.isArray(body.faqs)
+      ? body.faqs
+          .map((item) => ({
+            question: String(item?.question || item?.q || "").trim(),
+            answer: String(item?.answer || item?.a || "").trim(),
+          }))
+          .filter((item) => item.question && item.answer)
+          .slice(0, 20)
+      : [],
   };
 }
 

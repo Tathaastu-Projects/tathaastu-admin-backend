@@ -561,10 +561,12 @@ async function fetchEasebuzzInitiate(url, body) {
 }
 
 function storefrontBaseUrl() {
-  return String(process.env.STOREFRONT_URL || process.env.FRONTEND_URL || "http://localhost:3025").replace(
-    /\/$/,
-    "",
-  );
+  return String(
+    process.env.STOREFRONT_URL ||
+      process.env.FRONTEND_BASE_URL ||
+      process.env.FRONTEND_URL ||
+      "http://localhost:3025",
+  ).replace(/\/$/, "");
 }
 
 function backendPublicUrl(req) {
@@ -591,9 +593,31 @@ function assertOrderPaymentAccess(req, order) {
 }
 
 /**
+ * GET /api/store/payments/config
+ * Public gateway status for storefront (live vs demo, iframe, env).
+ */
+router.get("/payments/config", (_req, res) => {
+  const cfg = getEasebuzzConfig();
+  res.json({
+    success: true,
+    data: {
+      gateway: cfg.gateway || "easebuzz",
+      isConfigured: cfg.configured,
+      isDemo: cfg.isDemo,
+      environment: cfg.env,
+      iframe: cfg.iframe,
+      currency: "INR",
+      supportedModes: ["UPI", "CREDIT_CARD", "DEBIT_CARD", "NET_BANKING", "WALLET"],
+      paymentMethods: ["cod", "online"],
+    },
+  });
+});
+
+/**
  * POST /api/store/payments/easebuzz/initiate
  * Creates Easebuzz payment link for an existing store order.
  * Requires paymentToken from order create response.
+ * When keys are missing → demo mode (no Easebuzz call).
  */
 router.post("/payments/easebuzz/initiate", async (req, res) => {
   try {
@@ -601,7 +625,7 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
       return;
     }
 
-    const storeOrderId = req.body?.storeOrderId;
+    const storeOrderId = req.body?.storeOrderId || req.body?.orderId;
     if (!storeOrderId || !Types.ObjectId.isValid(storeOrderId)) {
       return res.status(400).json({ success: false, message: "Valid storeOrderId required" });
     }
@@ -627,13 +651,6 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
     }
 
     const cfg = getEasebuzzConfig();
-    if (!cfg.configured) {
-      return res.status(500).json({
-        success: false,
-        message: "Easebuzz keys missing. Set EASEBUZZ_MERCHANT_KEY and EASEBUZZ_SALT in backend .env",
-      });
-    }
-
     const amount = formatAmount(order.pricing?.total);
     if (Number(amount) < 1) {
       return res.status(400).json({ success: false, message: "Valid order amount required" });
@@ -653,12 +670,117 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
       });
     }
 
+    // Guard: if a payment attempt is already in-flight, sync first — don't mint another txn.
+    const forceNew = req.body?.forceNew === true || req.body?.forceNew === "1";
+    const { isFailureStatus } = require("../lib/easebuzz");
+    const { publicPaymentStatus, isPastPaymentExpiry } = require("../lib/paymentStatusView");
+    const hasInFlightTxn =
+      order.paymentStatus === "pending" &&
+      order.easebuzzTxnId &&
+      !isPastPaymentExpiry(order) &&
+      !isFailureStatus(order.easebuzzStatus);
+
+    if (hasInFlightTxn && !forceNew) {
+      if (cfg.configured) {
+        const sync = await syncStoreOrderPayment(order);
+        if (sync.action === "paid" || sync.action === "already_paid") {
+          return res.json({
+            success: true,
+            message: sync.message,
+            data: {
+              ...publicPaymentStatus(sync.order || order, { action: sync.action }),
+              isDemo: false,
+              paymentUrl: null,
+            },
+          });
+        }
+        if (sync.action === "failed" || sync.action === "expired") {
+          // Reload order then fall through to create a fresh txnid
+          order = (await StoreOrder.findById(order._id)) || order;
+        } else {
+          const latest = sync.order || order;
+          const existingUrl = latest.easebuzzAccessKey ? cfg.payUrl(latest.easebuzzAccessKey) : null;
+          return res.status(409).json({
+            success: false,
+            code: "PAYMENT_IN_PROGRESS",
+            message:
+              "Payment already in progress for this order. Do not pay again — wait or check status.",
+            data: {
+              ...publicPaymentStatus(latest, { action: sync.action || "pending" }),
+              paymentUrl: existingUrl,
+              syncPath: "/api/store/payments/easebuzz/sync",
+              statusPath: "/api/store/payments/status",
+            },
+          });
+        }
+      } else {
+        return res.status(409).json({
+          success: false,
+          code: "PAYMENT_IN_PROGRESS",
+          message: "Demo payment already initiated. Call confirm-demo or wait.",
+          data: {
+            ...publicPaymentStatus(order, { action: "pending" }),
+            demoConfirmPath: "/api/store/payments/easebuzz/confirm-demo",
+          },
+        });
+      }
+    }
+
     // Always mint a fresh txnid for a new initiate attempt (Easebuzz rejects reuse)
     const txnid = `ABM${Date.now()}${crypto.randomBytes(3).toString("hex")}`.slice(0, 40);
     const productinfo = `Order ${order.orderNumber}`.slice(0, 100);
     const udf1 = String(order._id);
     const udf2 = String(order.orderNumber || "");
     const returnUrl = `${backendPublicUrl(req)}/api/store/payments/easebuzz/return`;
+    const initiatedAt = new Date().toISOString();
+    const expiresAt = paymentExpiresAtFromNow();
+    const { upsertPaymentLedger } = require("../lib/easebuzzLedger");
+
+    // ---- Demo mode (keys missing): safe local unlock path ----
+    if (!cfg.configured) {
+      await StoreOrder.findByIdAndUpdate(String(order._id), {
+        $set: {
+          easebuzzTxnId: txnid,
+          easebuzzStatus: "demo_initiated",
+          paymentInitiatedAt: initiatedAt,
+          paymentExpiresAt: expiresAt,
+        },
+      });
+      await upsertPaymentLedger({
+        orderId: order._id,
+        orderNumber: order.orderNumber,
+        txnId: txnid,
+        amountInr: order.pricing?.total,
+        amountFormatted: amount,
+        status: "pending",
+        isDemo: true,
+        productInfo: productinfo,
+        customerName: firstname,
+        customerEmail: email,
+        customerPhone: phone,
+        udf1,
+        udf2,
+      });
+
+      return res.json({
+        success: true,
+        data: {
+          gateway: "easebuzz",
+          isDemo: true,
+          paymentUrl: null,
+          accessKey: null,
+          txnid,
+          amount,
+          env: cfg.env,
+          iframe: false,
+          orderNumber: order.orderNumber,
+          storeOrderId: String(order._id),
+          paymentExpiresAt: expiresAt,
+          message: "Easebuzz not configured — use confirm-demo to mark paid locally",
+          demoConfirmPath: "/api/store/payments/easebuzz/confirm-demo",
+        },
+      });
+    }
 
     const hash = generateRequestHash({
       key: cfg.key,
@@ -735,8 +857,6 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
 
     const accessKey = String(data.data);
     const paymentUrl = cfg.payUrl(accessKey);
-    const initiatedAt = new Date().toISOString();
-    const expiresAt = paymentExpiresAtFromNow();
 
     // Single write after success (avoid double full-file save before HTTPS)
     await StoreOrder.findByIdAndUpdate(String(order._id), {
@@ -748,6 +868,24 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
         paymentExpiresAt: expiresAt,
       },
     });
+
+    await upsertPaymentLedger({
+      orderId: order._id,
+      orderNumber: order.orderNumber,
+      txnId: txnid,
+      amountInr: order.pricing?.total,
+      amountFormatted: amount,
+      status: "initiated",
+      isDemo: false,
+      productInfo: productinfo,
+      customerName: firstname,
+      customerEmail: email,
+      customerPhone: phone,
+      udf1,
+      udf2,
+      rawInitiate: { accessKey, paymentUrl, env: cfg.env, iframe: cfg.iframe },
+    });
+
     console.log("[easebuzz-initiate] OK", {
       orderNumber: order.orderNumber,
       txnid,
@@ -757,11 +895,15 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
     return res.json({
       success: true,
       data: {
+        gateway: "easebuzz",
+        isDemo: false,
         paymentUrl,
         accessKey,
+        actionUrl: paymentUrl,
         txnid,
         amount,
         env: cfg.env,
+        iframe: cfg.iframe,
         orderNumber: order.orderNumber,
         storeOrderId: String(order._id),
         paymentExpiresAt: expiresAt,
@@ -775,6 +917,111 @@ router.post("/payments/easebuzz/initiate", async (req, res) => {
         message: error instanceof Error ? error.message : "Payment initiation failed",
       });
     }
+  }
+});
+
+/**
+ * POST /api/store/payments/easebuzz/confirm-demo
+ * Local/dev unlock when Easebuzz keys are missing. Requires paymentToken.
+ * Blocked when live/test keys are configured (unless ledger isDemo).
+ */
+router.post("/payments/easebuzz/confirm-demo", async (req, res) => {
+  try {
+    if (!rateLimitPayment(req, res, { key: "easebuzz-demo", max: 20, windowMs: 60 * 1000 })) {
+      return;
+    }
+    const cfg = getEasebuzzConfig();
+    const storeOrderId = req.body?.storeOrderId || req.body?.orderId;
+    if (!storeOrderId || !Types.ObjectId.isValid(storeOrderId)) {
+      return res.status(400).json({ success: false, message: "Valid storeOrderId required" });
+    }
+    const order = await StoreOrder.findById(storeOrderId);
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    const access = assertOrderPaymentAccess(req, order);
+    if (!access.ok) {
+      return res.status(access.status).json({ success: false, message: access.message });
+    }
+
+    const StorePayment = require("../models/StorePayment");
+    const { applyPaidAtomically } = require("../lib/easebuzzPayments");
+    const { upsertPaymentLedger } = require("../lib/easebuzzLedger");
+
+    let payment = order.easebuzzTxnId
+      ? await StorePayment.findOne({ txnId: order.easebuzzTxnId })
+      : null;
+    if (!payment) {
+      payment = await StorePayment.findOne({ orderId: String(order._id) });
+    }
+
+    if (!cfg.isDemo && payment?.isDemo !== true) {
+      return res.status(403).json({
+        success: false,
+        message: "Demo confirm is disabled when Easebuzz live/test keys are configured",
+      });
+    }
+
+    if (order.paymentStatus === "paid") {
+      return res.json({
+        success: true,
+        verified: true,
+        isDemo: true,
+        message: "Order already paid",
+        data: {
+          orderNumber: order.orderNumber,
+          paymentStatus: order.paymentStatus,
+          status: order.status,
+        },
+      });
+    }
+
+    const txnid = order.easebuzzTxnId || `DEMO${Date.now()}`;
+    const easepayid = `DEMO-${Date.now()}`;
+    await upsertPaymentLedger({
+      orderId: order._id,
+      orderNumber: order.orderNumber,
+      txnId: txnid,
+      easepayId: easepayid,
+      amountInr: order.pricing?.total,
+      amountFormatted: formatAmount(order.pricing?.total),
+      status: "success",
+      isDemo: true,
+      customerName: order.customer?.name,
+      customerEmail: order.customer?.email,
+      customerPhone: order.customer?.phone,
+      rawCallback: { status: "success", demo: true },
+    });
+
+    const result = await applyPaidAtomically(
+      order,
+      {
+        txnid,
+        easepayid,
+        amount: formatAmount(order.pricing?.total),
+        status: "success",
+        isDemo: true,
+      },
+      "demo_confirm",
+    );
+
+    return res.json({
+      success: true,
+      verified: true,
+      isDemo: true,
+      status: "success",
+      message: result.message || "Demo payment confirmed",
+      data: {
+        orderNumber: result.order?.orderNumber || order.orderNumber,
+        paymentStatus: result.order?.paymentStatus || "paid",
+        status: result.order?.status,
+        txnid,
+        easepayid,
+      },
+    });
+  } catch (error) {
+    console.error("Demo confirm error:", error);
+    return res.status(500).json({ success: false, message: "Demo confirm failed" });
   }
 });
 
@@ -883,14 +1130,71 @@ router.post("/payments/easebuzz/callback", handleEasebuzzReturn);
 router.get("/payments/easebuzz/callback", handleEasebuzzReturn);
 
 /**
- * Manually sync one order with Easebuzz (network/callback miss recovery).
- * POST /api/store/payments/easebuzz/sync  { storeOrderId, paymentToken, phone? }
+ * Poll-friendly payment status (no Easebuzz call).
+ * GET /api/store/payments/status?storeOrderId=&paymentToken=
+ * GET /api/store/payments/status?orderNumber=&phone=
+ * Also accepts paymentToken header X-Payment-Token.
  */
-router.post("/payments/easebuzz/sync", async (req, res) => {
+router.get("/payments/status", async (req, res) => {
   try {
-    if (!rateLimitPayment(req, res, { key: "easebuzz-sync", max: 10, windowMs: 60 * 1000 })) {
+    if (!rateLimitPayment(req, res, { key: "payment-status", max: 60, windowMs: 60 * 1000 })) {
       return;
     }
+    const { publicPaymentStatus } = require("../lib/paymentStatusView");
+    const storeOrderId = req.query.storeOrderId || req.query.orderId;
+    const orderNumber = req.query.orderNumber ? String(req.query.orderNumber).trim().toUpperCase() : "";
+    const phone = String(req.query.phone || "").trim();
+    const paymentToken = String(
+      req.query.paymentToken || req.headers["x-payment-token"] || "",
+    ).trim();
+
+    let order = null;
+    if (storeOrderId && Types.ObjectId.isValid(storeOrderId)) {
+      order = await StoreOrder.findById(storeOrderId);
+    } else if (orderNumber) {
+      order = await StoreOrder.findOne({ orderNumber });
+    }
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    if (paymentToken) {
+      if (!verifyOrderPaymentToken(paymentToken, order._id, order.customer?.phone)) {
+        return res.status(403).json({ success: false, message: "Invalid or expired payment token" });
+      }
+    } else if (phone) {
+      if (!phonesMatch(phone, order.customer?.phone)) {
+        return res.status(403).json({ success: false, message: "Phone does not match this order" });
+      }
+    } else {
+      return res.status(401).json({
+        success: false,
+        message: "paymentToken or orderNumber+phone required",
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: publicPaymentStatus(order),
+    });
+  } catch (error) {
+    console.error("Payment status error:", error);
+    return res.status(500).json({ success: false, message: "Failed to load payment status" });
+  }
+});
+
+/**
+ * Manually sync one order with Easebuzz (network/callback miss recovery).
+ * POST /api/store/payments/easebuzz/sync  { storeOrderId, paymentToken, phone? }
+ * Alias: POST /api/store/payments/sync
+ * Use this after timeout / back button / "still processing".
+ */
+async function handlePaymentSync(req, res) {
+  try {
+    if (!rateLimitPayment(req, res, { key: "easebuzz-sync", max: 20, windowMs: 60 * 1000 })) {
+      return;
+    }
+    const { publicPaymentStatus } = require("../lib/paymentStatusView");
     const storeOrderId = req.body?.storeOrderId || req.body?.orderId;
     if (!storeOrderId || !Types.ObjectId.isValid(storeOrderId)) {
       return res.status(400).json({ success: false, message: "storeOrderId required" });
@@ -907,24 +1211,23 @@ router.post("/payments/easebuzz/sync", async (req, res) => {
     if (result.action === "missing") {
       return res.status(404).json({ success: false, message: result.message });
     }
+    const latest = result.order || order;
     res.json({
       success: true,
       message: result.message,
-      data: {
+      data: publicPaymentStatus(latest, {
         action: result.action,
-        orderNumber: result.order?.orderNumber,
-        paymentStatus: result.order?.paymentStatus,
-        status: result.order?.status,
-        easebuzzTxnId: result.order?.easebuzzTxnId,
-        easebuzzPaymentId: result.order?.easebuzzPaymentId,
-        easebuzzStatus: result.order?.easebuzzStatus,
-      },
+        synced: true,
+      }),
     });
   } catch (error) {
     console.error("Easebuzz sync error:", error);
     res.status(500).json({ success: false, message: "Payment sync failed" });
   }
-});
+}
+
+router.post("/payments/easebuzz/sync", handlePaymentSync);
+router.post("/payments/sync", handlePaymentSync);
 
 /**
  * Batch reconcile pending online payments.
@@ -941,6 +1244,136 @@ router.post("/admin/payments/reconcile", requireAdminAuth, async (_req, res) => 
   } catch (error) {
     console.error("Easebuzz reconcile error:", error);
     res.status(500).json({ success: false, message: "Payment reconcile failed" });
+  }
+});
+
+/**
+ * Admin refund (Easebuzz Refund API v2).
+ * POST /api/store/admin/payments/refund
+ * Body: { orderId|orderNumber|txnId|easepayId|paymentId, amount?, cancelOrder?, merchantRefundId? }
+ * Also available at POST /api/store/payments/easebuzz/refund (admin auth).
+ */
+async function handleAdminRefund(req, res) {
+  try {
+    if (!rateLimitPayment(req, res, { key: "easebuzz-refund", max: 20, windowMs: 60 * 1000 })) {
+      return;
+    }
+    const { refundStoreOrderPayment } = require("../lib/easebuzzLedger");
+    const body = req.body || {};
+    const result = await refundStoreOrderPayment({
+      orderId: body.orderId || body.storeOrderId || body.bookingId,
+      orderNumber: body.orderNumber,
+      txnId: body.txnId || body.txnid,
+      easepayId: body.easepayId || body.easepayid,
+      paymentId: body.paymentId,
+      amount: body.amount,
+      merchantRefundId: body.merchantRefundId,
+      splitLabels: body.splitLabels,
+      cancelOrder: body.cancelOrder !== false && body.cancelBooking !== false,
+      allowDemo: true,
+    });
+    if (!result.ok) {
+      return res.status(result.status || 400).json({
+        success: false,
+        message: result.message,
+        raw: result.raw,
+      });
+    }
+    return res.json({
+      success: true,
+      message: result.message,
+      data: result.data,
+    });
+  } catch (error) {
+    console.error("Easebuzz refund error:", error);
+    return res.status(500).json({
+      success: false,
+      message: error instanceof Error ? error.message : "Refund failed",
+    });
+  }
+}
+
+router.post("/admin/payments/refund", requireAdminAuth, handleAdminRefund);
+router.post("/payments/easebuzz/refund", requireAdminAuth, handleAdminRefund);
+router.post("/payments/refund", requireAdminAuth, handleAdminRefund);
+
+/**
+ * Admin: list orders that need manual review (e.g. paid after cancel/stock restore).
+ * GET /api/store/admin/payments/manual-review
+ */
+router.get("/admin/payments/manual-review", requireAdminAuth, async (req, res) => {
+  try {
+    const limitNum = Math.min(Math.max(Number(req.query.limit) || 50, 1), 100);
+    const items = await StoreOrder.find({ needsManualReview: true })
+      .sort({ updatedAt: -1 })
+      .limit(limitNum);
+    res.json({
+      success: true,
+      data: items,
+      count: items.length,
+    });
+  } catch (error) {
+    console.error("Manual review list error:", error);
+    res.status(500).json({ success: false, message: "Failed to load manual-review orders" });
+  }
+});
+
+/**
+ * Admin: resolve manual-review flag (after refund or ops decision).
+ * POST /api/store/admin/payments/manual-review/:id/resolve
+ * Body: { note?, refund?: true, amount? }
+ */
+router.post("/admin/payments/manual-review/:id/resolve", requireAdminAuth, async (req, res) => {
+  try {
+    const order = await StoreOrder.findById(req.params.id);
+    if (!order) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    let refundResult = null;
+    if (req.body?.refund === true) {
+      const { refundStoreOrderPayment } = require("../lib/easebuzzLedger");
+      refundResult = await refundStoreOrderPayment({
+        orderId: order._id,
+        amount: req.body.amount,
+        cancelOrder: true,
+        allowDemo: true,
+      });
+      if (!refundResult.ok) {
+        return res.status(refundResult.status || 400).json({
+          success: false,
+          message: refundResult.message,
+          raw: refundResult.raw,
+        });
+      }
+    }
+
+    const latest = await StoreOrder.findById(order._id);
+    if (!latest) {
+      return res.status(404).json({ success: false, message: "Order not found after refund" });
+    }
+    latest.needsManualReview = false;
+    const note = String(req.body?.note || "").trim();
+    if (note) {
+      latest.adminNote = [String(latest.adminNote || "").trim(), note].filter(Boolean).join("\n");
+    }
+    await latest.save();
+
+    res.json({
+      success: true,
+      message: refundResult ? "Refunded and manual review cleared" : "Manual review cleared",
+      data: {
+        orderId: latest._id,
+        orderNumber: latest.orderNumber,
+        paymentStatus: latest.paymentStatus,
+        status: latest.status,
+        needsManualReview: latest.needsManualReview,
+        refund: refundResult?.data || null,
+      },
+    });
+  } catch (error) {
+    console.error("Manual review resolve error:", error);
+    res.status(500).json({ success: false, message: "Failed to resolve manual review" });
   }
 });
 

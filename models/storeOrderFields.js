@@ -10,7 +10,14 @@
  */
 module.exports = {
   ORDER_STATUSES: ["placed", "confirmed", "packed", "shipped", "delivered", "cancelled"],
-  PAYMENT_STATUSES: ["pending", "paid", "failed", "expired", "refunded"],
+  PAYMENT_STATUSES: [
+    "pending",
+    "paid",
+    "failed",
+    "expired",
+    "partial_refunded",
+    "refunded",
+  ],
   PAYMENT_METHODS: ["cod", "online"],
   /** Document fields used by Easebuzz flow */
   EASEBUZZ_FIELDS: [
@@ -24,6 +31,7 @@ module.exports = {
     "paymentInitiatedAt",
     "paymentSyncedAt",
     "paymentSyncSource",
+    "refundedAmountInr",
     "paymentToken", // not stored — issued HMAC to client only
   ],
 };

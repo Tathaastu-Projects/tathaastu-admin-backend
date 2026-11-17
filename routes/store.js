@@ -184,6 +184,7 @@ router.get("/meta", async (_req, res) => {
         "limit",
       ],
       paymentMethods: ["cod", "online"],
+      paymentGateway: process.env.PAYMENT_GATEWAY || "easebuzz",
       currency: "INR",
       trustBadges: [
         { id: "lab", label: "Lab Certified" },
@@ -709,10 +710,16 @@ router.get("/orders/:orderNumber", async (req, res) => {
  */
 router.get("/admin/orders", requireAdminAuth, async (req, res) => {
   try {
-    const { status, q, page = 1, limit = 30 } = req.query;
+    const { status, paymentStatus, needsManualReview, q, page = 1, limit = 30 } = req.query;
     const filter = {};
     if (status && ORDER_STATUSES.includes(String(status))) {
       filter.status = status;
+    }
+    if (paymentStatus) {
+      filter.paymentStatus = String(paymentStatus);
+    }
+    if (String(needsManualReview) === "1" || String(needsManualReview) === "true") {
+      filter.needsManualReview = true;
     }
     if (q) {
       const term = String(q).trim();
@@ -721,6 +728,7 @@ router.get("/admin/orders", requireAdminAuth, async (req, res) => {
         { "customer.name": new RegExp(term, "i") },
         { "customer.phone": new RegExp(term, "i") },
         { "customer.email": new RegExp(term, "i") },
+        { easebuzzTxnId: new RegExp(term, "i") },
       ];
     }
 
@@ -817,7 +825,14 @@ router.patch("/admin/orders/:id/status", requireAdminAuth, async (req, res) => {
       order.adminNote = String(req.body.adminNote || "");
     }
     if (req.body?.paymentStatus) {
-      const allowedPay = ["pending", "paid", "failed", "refunded"];
+      const allowedPay = [
+        "pending",
+        "paid",
+        "failed",
+        "expired",
+        "partial_refunded",
+        "refunded",
+      ];
       if (allowedPay.includes(String(req.body.paymentStatus))) {
         order.paymentStatus = req.body.paymentStatus;
       }

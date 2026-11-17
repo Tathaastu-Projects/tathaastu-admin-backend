@@ -22,7 +22,14 @@ const {
   uploadAboutMedia,
   uploadBlogMedia,
   uploadHeroMedia,
+  uploadHowImage,
 } = require("../middleware/upload");
+const {
+  HOW_ABHIMANTRIT_SLUG,
+  DEFAULT_HOW_SECTION,
+  DEFAULT_HOW_STEPS,
+  howStepById,
+} = require("../lib/howAbhimantrit");
 const {
   HOME_HERO_VIDEO_SLUG,
   DEFAULT_HOME_HERO_VIDEO,
@@ -1499,18 +1506,24 @@ router.get("/content/home", async (_req, res) => {
       categoryTiles,
       aboutSection,
       featuredFinds,
+      howAbhimantrit,
       screenToSpace,
       testimonials,
       homeHeroVideo,
       rashiLogos,
     ] = await Promise.all([
       StoreBanner.find({ isActive: true }).sort({ sortOrder: 1, createdAt: -1 }),
-      StoreBlogPost.find({ status: "published" }).sort({ publishedAt: -1 }).limit(6),
+      StoreBlogPost.find({ status: "published" })
+        .select("title slug coverImage coverVideo excerpt publishedAt status")
+        .sort({ publishedAt: -1 })
+        .limit(6)
+        .lean(),
       Product.find({ status: "listed" }).sort({ createdAt: -1 }).lean(),
       readHomeFaqs(),
       readCategoryTiles(),
       readAboutSection(),
       readFeaturedFinds(),
+      readHowAbhimantrit(),
       readScreenToSpace(),
       readTestimonials(),
       readHomeHeroVideo(),
@@ -1544,37 +1557,41 @@ router.get("/content/home", async (_req, res) => {
       };
     });
 
+    const { slimCardProduct, slimCardProducts } = require("../lib/slimProduct");
+
     const intentionProducts = {};
     for (const intention of INTENTIONS) {
       const hit = listedProducts.find((p) =>
         Array.isArray(p.intentions) ? p.intentions.includes(intention) : false
       );
-      if (hit) intentionProducts[intention] = hit;
+      if (hit) intentionProducts[intention] = slimCardProduct(hit);
     }
 
     // Match Rashi / zodiac bracelets by title, Hindi/English sign names, or attributes.zodiac
     // (old filter only checked "rashi|राशि" in title — so the homepage section vanished)
     const RASHI_RE =
       /राशि|rashi|mesh|vrishabha|mithun|karka|simha|kanya|tula|vrishchik|dhanu|makar|kumbh|meen|aries|taurus|gemini|cancer|\bleo\b|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces|मेष|वृषभ|मिथुन|कर्क|सिंह|कन्या|तुला|वृश्चिक|धनु|मकर|कुम्भ|मीन/i;
-    const rashiProducts = listedProducts
-      .filter((p) => {
-        const title = String(p.title || "");
-        const zodiac = String(p.attributes?.zodiac || "");
-        const tags = Array.isArray(p.tags) ? p.tags.join(" ") : String(p.tags || "");
-        const category = String(p.category || "");
-        return (
-          RASHI_RE.test(title) ||
-          RASHI_RE.test(zodiac) ||
-          /rashi|zodiac/i.test(tags) ||
-          /rashi/i.test(category)
-        );
-      })
-      .slice(0, 48);
+    const rashiProducts = slimCardProducts(
+      listedProducts
+        .filter((p) => {
+          const title = String(p.title || "");
+          const zodiac = String(p.attributes?.zodiac || "");
+          const tags = Array.isArray(p.tags) ? p.tags.join(" ") : String(p.tags || "");
+          const category = String(p.category || "");
+          return (
+            RASHI_RE.test(title) ||
+            RASHI_RE.test(zodiac) ||
+            /rashi|zodiac/i.test(tags) ||
+            /rashi/i.test(category)
+          );
+        })
+        .slice(0, 48),
+    );
 
-    const latestProducts = listedProducts.slice(0, 20);
-    const featured = listedProducts.filter((p) => p.isFeatured).slice(0, 16);
-    const bestsellers = listedProducts.filter((p) => p.isBestSeller).slice(0, 16);
-    const newArrivals = listedProducts.filter((p) => p.isNewArrival).slice(0, 16);
+    const latestProducts = slimCardProducts(listedProducts.slice(0, 20));
+    const featured = slimCardProducts(listedProducts.filter((p) => p.isFeatured).slice(0, 16));
+    const bestsellers = slimCardProducts(listedProducts.filter((p) => p.isBestSeller).slice(0, 16));
+    const newArrivals = slimCardProducts(listedProducts.filter((p) => p.isNewArrival).slice(0, 16));
 
     let heroTicker = [];
     try {
@@ -1599,6 +1616,7 @@ router.get("/content/home", async (_req, res) => {
         categoryTiles,
         aboutSection,
         featuredFinds,
+        howAbhimantrit,
         screenToSpace,
         testimonials,
         trustBadges: [
@@ -3222,6 +3240,173 @@ router.delete("/admin/featured-finds/image", async (_req, res) => {
   } catch (error) {
     console.error("Delete featured image error:", error);
     res.status(500).json({ success: false, message: "Failed to remove photo" });
+  }
+});
+
+/* ------------------------ How Abhimantrit (4 circular steps) ------------------------ */
+
+function removeHowFile(fileUrl) {
+  if (!fileUrl || !String(fileUrl).startsWith("/uploads/how-abhimantrit/")) return;
+  // Keep seeded defaults on disk so clearing an override can fall back
+  const base = path.basename(String(fileUrl));
+  if (
+    [
+      "thoughtfully-sourced.png",
+      "cleansed-carefully.png",
+      "energised-intentionally.png",
+      "delivered.png",
+    ].includes(base)
+  ) {
+    return;
+  }
+  deleteUploadByUrl(fileUrl).catch(() => {});
+}
+
+async function readHowAbhimantrit() {
+  const page = await StorePage.findOne({ slug: HOW_ABHIMANTRIT_SLUG }).select("content").lean();
+  let saved = {};
+  if (page?.content) {
+    try {
+      saved = JSON.parse(page.content) || {};
+    } catch (_error) {
+      saved = {};
+    }
+  }
+  const savedSteps = Array.isArray(saved.steps) ? saved.steps : [];
+  const steps = DEFAULT_HOW_STEPS.map((def) => {
+    const hit = savedSteps.find((item) => String(item?.id || "") === def.id) || {};
+    return {
+      id: def.id,
+      title: String(hit.title || def.title).trim() || def.title,
+      image: String(hit.image || def.image || "").trim(),
+    };
+  });
+  return {
+    enabled: saved.enabled !== false,
+    title: String(saved.title || DEFAULT_HOW_SECTION.title).trim() || DEFAULT_HOW_SECTION.title,
+    steps,
+  };
+}
+
+async function writeHowAbhimantrit(section) {
+  await StorePage.findOneAndUpdate(
+    { slug: HOW_ABHIMANTRIT_SLUG },
+    {
+      $set: {
+        title: "How Abhimantrit",
+        content: JSON.stringify(section),
+        isActive: true,
+      },
+      $setOnInsert: { slug: HOW_ABHIMANTRIT_SLUG },
+    },
+    { upsert: true },
+  );
+}
+
+router.get("/admin/how-abhimantrit", async (_req, res) => {
+  try {
+    res.json({ success: true, data: await readHowAbhimantrit() });
+  } catch (error) {
+    console.error("Load How Abhimantrit error:", error);
+    res.status(500).json({ success: false, message: "Failed to load How Abhimantrit" });
+  }
+});
+
+router.put("/admin/how-abhimantrit", async (req, res) => {
+  try {
+    const current = await readHowAbhimantrit();
+    const title = String(req.body?.title || "").trim();
+    if (!title) {
+      return res.status(400).json({ success: false, message: "Heading is required" });
+    }
+    let stepsMeta = [];
+    if (typeof req.body?.steps === "string" && req.body.steps.trim()) {
+      try {
+        stepsMeta = JSON.parse(req.body.steps);
+      } catch (_e) {
+        stepsMeta = [];
+      }
+    } else if (Array.isArray(req.body?.steps)) {
+      stepsMeta = req.body.steps;
+    }
+    const nextSteps = current.steps.map((step) => {
+      const hit = stepsMeta.find((item) => String(item?.id || "") === step.id) || {};
+      return {
+        id: step.id,
+        title: String(hit.title || step.title).trim() || step.title,
+        image: step.image,
+      };
+    });
+    const section = {
+      enabled: String(req.body?.enabled || "true") !== "false",
+      title,
+      steps: nextSteps,
+    };
+    await writeHowAbhimantrit(section);
+    require("../lib/responseCache").invalidatePrefix("store:");
+    res.json({ success: true, data: section });
+  } catch (error) {
+    console.error("Update How Abhimantrit error:", error);
+    res.status(500).json({ success: false, message: "Failed to update How Abhimantrit" });
+  }
+});
+
+router.put("/admin/how-abhimantrit/steps/:id", (req, res) => {
+  const def = howStepById(req.params.id);
+  if (!def) {
+    return res.status(404).json({ success: false, message: "Unknown step" });
+  }
+  uploadHowImage.single("image")(req, res, async (uploadError) => {
+    if (uploadError) {
+      return res.status(400).json({ success: false, message: uploadError.message || "Upload failed" });
+    }
+    try {
+      const current = await readHowAbhimantrit();
+      const title = String(req.body?.title || "").trim();
+      const steps = current.steps.map((step) => {
+        if (step.id !== def.id) return step;
+        let image = step.image;
+        if (req.file) {
+          const next = `/uploads/how-abhimantrit/${req.file.filename}`;
+          if (image && image !== next) removeHowFile(image);
+          image = next;
+        }
+        return {
+          id: step.id,
+          title: title || step.title,
+          image,
+        };
+      });
+      const section = { ...current, steps };
+      await writeHowAbhimantrit(section);
+      require("../lib/responseCache").invalidatePrefix("store:");
+      res.json({ success: true, data: section });
+    } catch (error) {
+      console.error("Update How Abhimantrit step error:", error);
+      res.status(500).json({ success: false, message: "Failed to update step image" });
+    }
+  });
+});
+
+router.delete("/admin/how-abhimantrit/steps/:id/image", async (req, res) => {
+  try {
+    const def = howStepById(req.params.id);
+    if (!def) {
+      return res.status(404).json({ success: false, message: "Unknown step" });
+    }
+    const current = await readHowAbhimantrit();
+    const steps = current.steps.map((step) => {
+      if (step.id !== def.id) return step;
+      if (step.image) removeHowFile(step.image);
+      return { ...step, image: def.image };
+    });
+    const section = { ...current, steps };
+    await writeHowAbhimantrit(section);
+    require("../lib/responseCache").invalidatePrefix("store:");
+    res.json({ success: true, data: section, message: "Image reset to default" });
+  } catch (error) {
+    console.error("Delete How Abhimantrit step image error:", error);
+    res.status(500).json({ success: false, message: "Failed to reset image" });
   }
 });
 

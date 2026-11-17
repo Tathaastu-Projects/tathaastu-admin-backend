@@ -3,6 +3,7 @@ require("dotenv").config({ path: path.join(__dirname, ".env") });
 const express = require("express");
 const cors = require("cors");
 const helmet = require("helmet");
+const compression = require("compression");
 const { ensureStorageLayout, STORAGE_ROOT, DATA_DIR } = require("./lib/fileDb");
 
 ensureStorageLayout();
@@ -18,6 +19,8 @@ app.use(
     crossOriginResourcePolicy: { policy: "cross-origin" },
   }),
 );
+// Gzip JSON / text responses (home + catalog payloads)
+app.use(compression({ threshold: 1024 }));
 app.use(
   cors({
     origin: [

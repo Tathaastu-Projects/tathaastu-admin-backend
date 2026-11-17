@@ -633,9 +633,16 @@ router.get("/", async (req, res) => {
     }
 
     const skip = (pageNum - 1) * limitNum;
-    // lean() avoids wrapping every doc in a Document class — faster list loads
+    // lean() + field trim — list UI only needs identity, prices, badges, primary image
     const [items, total] = await Promise.all([
-      Product.find(filter).sort({ updatedAt: -1 }).skip(skip).limit(limitNum).lean(),
+      Product.find(filter)
+        .select(
+          "title slug sku status category intentions mrp salePrice discountPercent quantity totalStock isFeatured isBestSeller isNewArrival images updatedAt createdAt",
+        )
+        .sort({ updatedAt: -1 })
+        .skip(skip)
+        .limit(limitNum)
+        .lean(),
       Product.countDocuments(filter),
     ]);
 

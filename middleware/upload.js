@@ -5,6 +5,7 @@ const multer = require("multer");
 const { mirrorToStorage } = require("../lib/storedFiles");
 const { ensureStorageLayout } = require("../lib/fileDb/paths");
 const { compressVideoFile, isVideoFile } = require("../lib/compressVideo");
+const { compressImageFile, isImageFile } = require("../lib/compressImage");
 
 ensureStorageLayout();
 
@@ -46,6 +47,18 @@ function diskStorage(rootDir, storageSubdir) {
         // Auto-compress videos after upload (smaller file, near-same quality)
         if (isVideoFile(fullPath, file.mimetype)) {
           compressVideoFile(fullPath, { mimetype: file.mimetype })
+            .then((result) => {
+              finishUpload(result.path, result.filename, result.size || out.bytesWritten);
+            })
+            .catch(() => {
+              finishUpload(fullPath, filename, out.bytesWritten);
+            });
+          return;
+        }
+
+        // Resize + WebP images (banners/products often arrive as 5–8MB PNGs)
+        if (isImageFile(fullPath, file.mimetype)) {
+          compressImageFile(fullPath, { mimetype: file.mimetype })
             .then((result) => {
               finishUpload(result.path, result.filename, result.size || out.bytesWritten);
             })
@@ -166,6 +179,16 @@ const uploadHeroMedia = multer({
   limits: { fileSize: VIDEO_UPLOAD_MAX, files: 2 },
 });
 
+const howRoot = path.join(__dirname, "..", "uploads", "how-abhimantrit");
+fs.mkdirSync(howRoot, { recursive: true });
+const howStorage = diskStorage(howRoot, "how-abhimantrit");
+
+const uploadHowImage = multer({
+  storage: howStorage,
+  fileFilter: bannerFileFilter,
+  limits: { fileSize: 8 * 1024 * 1024, files: 1 },
+});
+
 module.exports = {
   uploadProductImages,
   uploadBannerImage,
@@ -175,6 +198,7 @@ module.exports = {
   uploadAboutMedia,
   uploadBlogMedia,
   uploadHeroMedia,
+  uploadHowImage,
   uploadRoot,
   bannerRoot,
   featuredRoot,
@@ -182,4 +206,5 @@ module.exports = {
   aboutRoot,
   blogsRoot,
   heroRoot,
+  howRoot,
 };

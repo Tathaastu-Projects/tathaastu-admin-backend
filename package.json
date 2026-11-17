@@ -16,10 +16,12 @@
     "test:pay": "node scripts/test-easebuzz-twice.js",
     "test:pay:live": "node scripts/test-easebuzz-twice.js https://storebackend.abhimantritstore.com",
     "test:pay:local": "node scripts/test-easebuzz-twice.js http://127.0.0.1:3024",
-    "diag:pay": "node scripts/diag-initiate-crash.js"
+    "diag:pay": "node scripts/diag-initiate-crash.js",
+    "optimize:images": "node scripts/optimizeExistingImages.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
+    "compression": "^1.8.2",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",

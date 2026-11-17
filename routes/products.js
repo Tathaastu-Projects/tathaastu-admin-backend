@@ -901,6 +901,7 @@ router.put("/:id", async (req, res) => {
       "variants",
       "images",
       "intentions",
+      "faqs",
       "isFeatured",
       "isBestSeller",
       "isNewArrival",

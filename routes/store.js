@@ -215,7 +215,12 @@ router.get("/menu", (_req, res) => {
  */
 router.get("/catalog", async (req, res) => {
   const { getOrCompute } = require("../lib/responseCache");
-  const cacheKey = `store:catalog:${JSON.stringify(req.query || {})}`;
+  // Ignore cache-buster / analytics keys so shoppers share one catalog entry
+  const q = { ...(req.query || {}) };
+  delete q._;
+  delete q.t;
+  delete q.cb;
+  const cacheKey = `store:catalog:${JSON.stringify(q)}`;
   const CATALOG_TTL_MS = 45_000;
 
   try {

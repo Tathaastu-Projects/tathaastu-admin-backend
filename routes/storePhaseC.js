@@ -1477,178 +1477,118 @@ router.post("/payments/cancel-unpaid", async (req, res) => {
 
 /* ------------------------ CMS: banners / blogs / pages ------------------------ */
 
-router.get("/content/home", async (_req, res) => {
+router.get("/content/home", async (req, res) => {
   const { getOrCompute } = require("../lib/responseCache");
-  const cacheKey = "store:content:home";
-  // 60s JSON cache — many shoppers share one payload; writes invalidate "store:"
+  // scope=above → first paint (hero/banners/bestsellers)
+  // scope=below → deferred sections (intention/rashi/featured/blog/faq)
+  // scope=full  → complete payload (warmup / backwards compatible)
+  const scopeRaw = String(req.query.scope || "full").toLowerCase();
+  const scope = ["above", "below", "full"].includes(scopeRaw) ? scopeRaw : "full";
+  const cacheKey = `store:content:home:${scope}`;
   const HOME_TTL_MS = 60_000;
 
   try {
     const result = await getOrCompute(cacheKey, HOME_TTL_MS, async () => {
-    const Product = require("../models/Product");
-    const { INTENTIONS, ZODIAC_SIGNS, CATEGORIES } = require("../lib/storeCatalog");
+      const { peekCollection } = require("../lib/fileDb/collectionStore");
+      const { INTENTIONS, ZODIAC_SIGNS } = require("../lib/storeCatalog");
+      const { buildHomeProductSlices } = require("../lib/homeProductSlices");
 
-    const intentionMeta = {
-      Peace: { color: "#7BA3A8", icon: "peace" },
-      Wealth: { color: "#C6A15B", icon: "wealth" },
-      Health: { color: "#6B9B7A", icon: "health" },
-      Protection: { color: "#8B5E5E", icon: "protection" },
-      Relationship: { color: "#C97B84", icon: "love" },
-      Success: { color: "#4F6F8F", icon: "success" },
-      Spirituality: { color: "#6E5A8A", icon: "spirit" },
-    };
-
-    const [
-      banners,
-      posts,
-      listedProducts,
-      faqs,
-      categoryTiles,
-      aboutSection,
-      featuredFinds,
-      howAbhimantrit,
-      screenToSpace,
-      testimonials,
-      homeHeroVideo,
-      rashiLogos,
-    ] = await Promise.all([
-      StoreBanner.find({ isActive: true }).sort({ sortOrder: 1, createdAt: -1 }),
-      StoreBlogPost.find({ status: "published" })
-        .select("title slug coverImage coverVideo excerpt publishedAt status")
-        .sort({ publishedAt: -1 })
-        .limit(6)
-        .lean(),
-      Product.find({ status: "listed" }).sort({ createdAt: -1 }).lean(),
-      readHomeFaqs(),
-      readCategoryTiles(),
-      readAboutSection(),
-      readFeaturedFinds(),
-      readHowAbhimantrit(),
-      readScreenToSpace(),
-      readTestimonials(),
-      readHomeHeroVideo(),
-      readRashiLogos(),
-    ]);
-
-    const countMap = {};
-    const sampleByCategory = {};
-    for (const product of listedProducts) {
-      const cat = product.category || "other";
-      countMap[cat] = (countMap[cat] || 0) + 1;
-      if (!sampleByCategory[cat]) sampleByCategory[cat] = product;
-    }
-
-    const categoryCards = CATEGORIES.map((cat) => {
-      const sample = sampleByCategory[cat];
-      return {
-        id: cat,
-        label:
-          categoryById(cat)?.label ||
-          cat
-            .split("-")
-            .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-            .join(" "),
-        href: `/shop/${cat}`,
-        productCount: countMap[cat] || 0,
-        image:
-          sample?.images?.find((i) => i.isPrimary)?.url ||
-          sample?.images?.[0]?.url ||
-          "",
+      const intentionMeta = {
+        Peace: { color: "#7BA3A8", icon: "peace" },
+        Wealth: { color: "#C6A15B", icon: "wealth" },
+        Health: { color: "#6B9B7A", icon: "health" },
+        Protection: { color: "#8B5E5E", icon: "protection" },
+        Relationship: { color: "#C97B84", icon: "love" },
+        Success: { color: "#4F6F8F", icon: "success" },
+        Spirituality: { color: "#6E5A8A", icon: "spirit" },
       };
-    });
 
-    const { slimCardProduct, slimCardProducts } = require("../lib/slimProduct");
+      const needAbove = scope === "above" || scope === "full";
+      const needBelow = scope === "below" || scope === "full";
 
-    const intentionProducts = {};
-    for (const intention of INTENTIONS) {
-      const hit = listedProducts.find((p) =>
-        Array.isArray(p.intentions) ? p.intentions.includes(intention) : false
+      const tasks = [];
+      // Shared: one peek of products (no deep-clone of entire DB)
+      tasks.push(
+        peekCollection("products").then((docs) =>
+          docs.filter((p) => p && p.status === "listed"),
+        ),
       );
-      if (hit) intentionProducts[intention] = slimCardProduct(hit);
-    }
 
-    // Match Rashi / zodiac bracelets by title, Hindi/English sign names, or attributes.zodiac
-    // (old filter only checked "rashi|राशि" in title — so the homepage section vanished)
-    const RASHI_RE =
-      /राशि|rashi|mesh|vrishabha|mithun|karka|simha|kanya|tula|vrishchik|dhanu|makar|kumbh|meen|aries|taurus|gemini|cancer|\bleo\b|virgo|libra|scorpio|sagittarius|capricorn|aquarius|pisces|मेष|वृषभ|मिथुन|कर्क|सिंह|कन्या|तुला|वृश्चिक|धनु|मकर|कुम्भ|मीन/i;
-    const rashiProducts = slimCardProducts(
-      listedProducts
-        .filter((p) => {
-          const title = String(p.title || "");
-          const zodiac = String(p.attributes?.zodiac || "");
-          const tags = Array.isArray(p.tags) ? p.tags.join(" ") : String(p.tags || "");
-          const category = String(p.category || "");
-          return (
-            RASHI_RE.test(title) ||
-            RASHI_RE.test(zodiac) ||
-            /rashi|zodiac/i.test(tags) ||
-            /rashi/i.test(category)
-          );
-        })
-        .slice(0, 48),
-    );
+      if (needAbove) {
+        tasks.push(
+          StoreBanner.find({ isActive: true, key: HOME_SLIDER_KEY }).sort({
+            sortOrder: 1,
+            createdAt: -1,
+          }),
+          readAboutSection(),
+          readHomeHeroVideo(),
+          (async () => {
+            try {
+              const { HERO_TICKER_SLUG, parseHeroTicker } = require("../lib/siteHeroTicker");
+              const tickerPage = await StorePage.findOne({ slug: HERO_TICKER_SLUG })
+                .select("content")
+                .lean();
+              return parseHeroTicker(tickerPage?.content || "").items;
+            } catch (_e) {
+              return [];
+            }
+          })(),
+        );
+      } else {
+        tasks.push(null, null, null, null);
+      }
 
-    const latestProducts = slimCardProducts(listedProducts.slice(0, 20));
-    const featured = slimCardProducts(listedProducts.filter((p) => p.isFeatured).slice(0, 16));
-    const bestsellers = slimCardProducts(listedProducts.filter((p) => p.isBestSeller).slice(0, 16));
-    const newArrivals = slimCardProducts(listedProducts.filter((p) => p.isNewArrival).slice(0, 16));
+      if (needBelow) {
+        tasks.push(
+          StoreBlogPost.find({ status: "published" })
+            .select("title slug coverImage coverVideo excerpt publishedAt status")
+            .sort({ publishedAt: -1 })
+            .limit(6)
+            .lean(),
+          readHomeFaqs(),
+          readCategoryTiles(),
+          readFeaturedFinds(),
+          readHowAbhimantrit(),
+          readScreenToSpace(),
+          readTestimonials(),
+          readRashiLogos(),
+        );
+      } else {
+        tasks.push(null, null, null, null, null, null, null, null);
+      }
 
-    let heroTicker = [];
-    try {
-      const { HERO_TICKER_SLUG, parseHeroTicker } = require("../lib/siteHeroTicker");
-      const tickerPage = await StorePage.findOne({ slug: HERO_TICKER_SLUG }).select("content").lean();
-      heroTicker = parseHeroTicker(tickerPage?.content || "").items;
-    } catch (_e) {
-      heroTicker = [];
-    }
-
-    const body = {
-      success: true,
-      data: {
-        brand: {
-          name: "Tathaastu",
-          tagline: "Authentic Rudraksha & Gemstones",
-        },
+      const [
+        listedProducts,
         banners,
-        heroTicker,
-        homeHeroVideo,
-        homeSliderManaged: true,
-        categoryTiles,
         aboutSection,
+        homeHeroVideo,
+        heroTicker,
+        posts,
+        faqs,
+        categoryTiles,
         featuredFinds,
         howAbhimantrit,
         screenToSpace,
         testimonials,
+        rashiLogos,
+      ] = await Promise.all(tasks);
+
+      const slices = buildHomeProductSlices(listedProducts, {
+        categoryLabel: (cat) => categoryById(cat)?.label,
+      });
+
+      const data = {
+        brand: {
+          name: "Tathaastu",
+          tagline: "Authentic Rudraksha & Gemstones",
+        },
+        homeSliderManaged: true,
         trustBadges: [
           { id: "authentic", label: "Authentic & Certified", description: "Curated listed products" },
           { id: "ship", label: "Free Shipping", description: "On eligible orders" },
           { id: "returns", label: "Easy Returns", description: "Support within 7 days" },
           { id: "cod", label: "COD Available", description: "Pay on delivery" },
         ],
-        intentions: INTENTIONS.map((name) => ({
-          id: name,
-          label: name === "Relationship" ? "Love" : name,
-          href: `/intention/${name}`,
-          color: intentionMeta[name]?.color || "#2F4F3E",
-          icon: intentionMeta[name]?.icon || "spark",
-        })),
-        intentionProducts,
-        rashiProducts,
-        rashiLogos,
-        latestProducts,
-        categories: categoryCards,
-        zodiacSigns: ZODIAC_SIGNS.map((sign) => ({
-          id: sign,
-          label: sign,
-          href: `/shop?zodiac=${encodeURIComponent(sign)}`,
-        })),
-        carousels: {
-          featured: featured.length ? featured : latestProducts.slice(0, 16),
-          bestsellers: bestsellers.length ? bestsellers : latestProducts.slice(0, 16),
-          newArrivals: newArrivals.length ? newArrivals : latestProducts.slice(0, 16),
-        },
-        latestBlogs: posts,
-        faqs,
         consultCta: {
           title: "Not sure what to buy? Talk to our experts",
           subtitle: "Get a free recommendation aligned to your intention.",
@@ -1656,13 +1596,51 @@ router.get("/content/home", async (_req, res) => {
           ctaHref: "/contact",
         },
         stats: {
-          listedProducts: listedProducts.length,
-          categoryCounts: countMap,
+          listedProducts: slices.listedCount,
+          categoryCounts: slices.countMap,
         },
-      },
-    };
+      };
 
-    return { status: 200, body };
+      if (needAbove) {
+        Object.assign(data, {
+          banners: banners || [],
+          heroTicker: heroTicker || [],
+          homeHeroVideo,
+          aboutSection,
+          carousels: slices.carousels,
+          latestProducts: slices.latestProducts,
+        });
+      }
+
+      if (needBelow) {
+        Object.assign(data, {
+          categoryTiles: categoryTiles || [],
+          featuredFinds,
+          howAbhimantrit,
+          screenToSpace,
+          testimonials: testimonials || [],
+          intentions: INTENTIONS.map((name) => ({
+            id: name,
+            label: name === "Relationship" ? "Love" : name,
+            href: `/intention/${name}`,
+            color: intentionMeta[name]?.color || "#2F4F3E",
+            icon: intentionMeta[name]?.icon || "spark",
+          })),
+          intentionProducts: slices.intentionProducts,
+          rashiProducts: slices.rashiProducts,
+          rashiLogos: rashiLogos || [],
+          categories: slices.categoryCards,
+          zodiacSigns: ZODIAC_SIGNS.map((sign) => ({
+            id: sign,
+            label: sign,
+            href: `/shop?zodiac=${encodeURIComponent(sign)}`,
+          })),
+          latestBlogs: posts || [],
+          faqs: faqs || [],
+        });
+      }
+
+      return { status: 200, body: { success: true, data } };
     });
 
     res.set("X-Cache", result.cache);
@@ -2305,7 +2283,18 @@ function removeHeroFile(fileUrl) {
 
 async function readHomeHeroVideo() {
   const page = await StorePage.findOne({ slug: HOME_HERO_VIDEO_SLUG }).select("content").lean();
-  return parseHomeHeroVideo(page?.content || "");
+  const data = parseHomeHeroVideo(page?.content || "");
+  // Instant first paint: if admin never set a poster, use sibling *-poster.jpg when present
+  if (data.videoUrl && !data.posterUrl && String(data.videoUrl).startsWith("/uploads/")) {
+    const fs = require("fs");
+    const path = require("path");
+    const base = path.basename(data.videoUrl, path.extname(data.videoUrl));
+    const dir = path.dirname(data.videoUrl);
+    const sibling = `${dir}/${base}-poster.jpg`;
+    const abs = path.join(__dirname, "..", sibling.replace(/^\//, ""));
+    if (fs.existsSync(abs)) data.posterUrl = sibling;
+  }
+  return data;
 }
 
 async function writeHomeHeroVideo(section) {

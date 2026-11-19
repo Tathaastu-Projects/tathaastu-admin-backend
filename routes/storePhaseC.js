@@ -1613,11 +1613,39 @@ router.get("/content/home", async (req, res) => {
       }
 
       if (needBelow) {
+        // Latest 5 listed products per reel category (for shoppable overlay)
+        const { slimCardProduct } = require("../lib/slimProduct");
+        const listed = Array.isArray(listedProducts) ? listedProducts : [];
+        const screenToSpaceWithProducts = (() => {
+          const section = screenToSpace || { items: [] };
+          const items = Array.isArray(section.items) ? section.items : [];
+          return {
+            ...section,
+            items: items.map((item) => {
+              const cat = String(item.categorySlug || "")
+                .trim()
+                .toLowerCase();
+              const products = cat
+                ? listed
+                    .filter((p) => String(p.category || "").toLowerCase() === cat)
+                    .sort((a, b) => {
+                      const ta = new Date(a.createdAt || 0).getTime();
+                      const tb = new Date(b.createdAt || 0).getTime();
+                      return tb - ta;
+                    })
+                    .slice(0, 5)
+                    .map(slimCardProduct)
+                : [];
+              return { ...item, products };
+            }),
+          };
+        })();
+
         Object.assign(data, {
           categoryTiles: categoryTiles || [],
           featuredFinds,
           howAbhimantrit,
-          screenToSpace,
+          screenToSpace: screenToSpaceWithProducts,
           testimonials: testimonials || [],
           intentions: INTENTIONS.map((name) => ({
             id: name,
